@@ -1,0 +1,10 @@
+[package]
+name = "gw-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SQLite(WAL) 存储实现：配置/电表档案/outbox/读数/电能日账/指令与事件日志"
+
+[dependencies]
+thiserror = { workspace = true }
+rusqlite = { workspace = true }

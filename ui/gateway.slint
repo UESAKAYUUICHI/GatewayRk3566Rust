@@ -1,0 +1,290 @@
+export global Theme {
+    out property <color> bg: #07121f;
+    out property <color> header: #0a1d32;
+    out property <color> surface: #0d243c;
+    out property <color> surface-2: #102d49;
+    out property <color> surface-3: #143854;
+    out property <color> line: #1b4768;
+    out property <color> text: #eef7ff;
+    out property <color> muted: #89a7bf;
+    out property <color> cyan: #18d4dc;
+    out property <color> blue: #237cf3;
+    out property <color> green: #34d5a2;
+    out property <color> amber: #f2b84b;
+    out property <color> red: #ff667d;
+}
+
+export struct MeterRow { id:int, device-sn:string, online:bool, addr:int, interval:int, enabled:bool, profile:string, last-read:string, voltage-a:float, current-a:float, power-kw:float, energy-kwh:float, today-kwh:float }
+export struct CmdRow { command-id:string, command-type:string, status:string, message:string }
+export struct EventRowLite { time:string, level:string, source:string, message:string }
+export struct WifiRow { ssid:string, signal:int, security:string, connected:bool }
+
+component StatusDot inherits Rectangle {
+    in property <bool> ok: true;
+    width: 10px; height: 10px; border-radius: 5px;
+    background: ok ? Theme.green : Theme.red;
+}
+
+component Card inherits Rectangle {
+    background: Theme.surface;
+    border-width: 1px; border-color: Theme.line; border-radius: 10px;
+    clip: true;
+}
+
+component ActionButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary: false;
+    in property <bool> danger: false;
+    callback clicked();
+    height: 50px; min-width: 124px; border-radius: 8px;
+    border-width: 1px;
+    border-color: primary ? Theme.blue : (danger ? #854052 : Theme.line);
+    background: primary ? Theme.blue : (danger ? #371f2b : Theme.surface-3);
+    Text { text: root.text; color: danger ? Theme.red : Theme.text; font-size: 16px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+    TouchArea { clicked => { root.clicked(); } }
+}
+
+component Field inherits VerticalLayout {
+    in property <string> label;
+    in-out property <string> value;
+    height: 68px; spacing: 6px;
+    Text { text: root.label; color: Theme.muted; font-size: 14px; }
+    Rectangle {
+        height: 43px; background: #091b2d; border-width: 1px; border-color: Theme.line; border-radius: 7px;
+        TextInput { x: 12px; width: parent.width - 24px; text <=> root.value; color: Theme.text; font-size: 16px; single-line: true; }
+    }
+}
+
+component SectionHeader inherits HorizontalLayout {
+    in property <string> title;
+    in property <string> hint: "";
+    height: 58px; padding-left: 18px; padding-right: 18px;
+    Text { text: root.title; color: Theme.text; font-size: 20px; font-weight: 700; vertical-alignment: center; }
+    Rectangle { }
+    Text { text: root.hint; color: Theme.muted; font-size: 14px; vertical-alignment: center; }
+}
+
+component InfoRow inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+    in property <bool> ok: true;
+    height: 44px; padding-left: 15px; padding-right: 15px;
+    Text { text: root.label; width: 132px; color: Theme.muted; font-size: 15px; vertical-alignment: center; }
+    Rectangle { }
+    Text { text: root.value == "" ? "—" : root.value; color: root.ok ? Theme.text : Theme.red; font-size: 15px; horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
+}
+
+component TopNavItem inherits Rectangle {
+    in property <string> label;
+    in property <string> code;
+    in property <int> index;
+    in property <int> active;
+    callback selected(int);
+    preferred-width: 150px; min-width: 138px; background: active == index ? #123d63 : transparent;
+    VerticalLayout {
+        alignment: center; spacing: 3px;
+        Text { text: root.code; color: active == index ? Theme.cyan : Theme.muted; font-size: 12px; font-weight: 700; horizontal-alignment: center; }
+        Text { text: root.label; color: Theme.text; font-size: 17px; font-weight: active == index ? 700 : 500; horizontal-alignment: center; }
+    }
+    if active == index: Rectangle { y: parent.height - 3px; width: parent.width; height: 3px; background: Theme.cyan; }
+    TouchArea { clicked => { root.selected(root.index); } }
+}
+
+component SideNavItem inherits Rectangle {
+    in property <string> label;
+    in property <string> hint: "";
+    in property <int> index;
+    in property <int> active;
+    callback selected(int);
+    preferred-height: 68px; min-height: 62px; border-radius: 9px;
+    background: active == index ? #123f64 : transparent;
+    border-width: active == index ? 1px : 0px; border-color: #276792;
+    HorizontalLayout {
+        padding-left: 14px; padding-right: 10px; spacing: 11px;
+        Rectangle { width: 4px; height: 28px; border-radius: 2px; background: active == index ? Theme.cyan : #28475f; }
+        VerticalLayout {
+            alignment: center; spacing: 2px;
+            Text { text: root.label; color: Theme.text; font-size: 16px; font-weight: 600; }
+            Text { text: root.hint; color: Theme.muted; font-size: 12px; overflow: elide; }
+        }
+    }
+    TouchArea { clicked => { root.selected(root.index); } }
+}
+
+component MetricCard inherits Card {
+    in property <string> label;
+    in property <string> value;
+    in property <string> hint;
+    in property <bool> ok: true;
+    VerticalLayout {
+        padding: 15px; spacing: 6px;
+        HorizontalLayout { Text { text: root.label; color: Theme.muted; font-size: 14px; } Rectangle {} StatusDot { ok: root.ok; } }
+        Text { text: root.value; color: Theme.text; font-size: 28px; font-weight: 700; }
+        Text { text: root.hint; color: root.ok ? Theme.muted : Theme.red; font-size: 13px; overflow: elide; }
+    }
+}
+
+export component GatewayWindow inherits Window {
+    in-out property <length> shell-width: 1280px;
+    in-out property <length> shell-height: 800px;
+    preferred-width: shell-width; preferred-height: shell-height; min-width: 1180px; min-height: 720px; background: Theme.bg;
+    title: "智能AI采集边缘网关系统";
+
+    in property <string> cloud-text: "连接中"; in property <bool> cloud-ok: false;
+    in property <string> clock-text: "同步中"; in property <bool> clock-ok: false;
+    in property <int> outbox-pending: 0; in property <int> outbox-sent: 0;
+    in property <int> meters-online: 0; in property <int> meters-total: 0;
+    in property <float> today-kwh: 0; in property <string> last-publish: "-";
+    in property <string> uptime: "-"; in property <string> version: "";
+    in-out property <int> page: 0; in-out property <int> channel-tab: 0;
+    in-out property <int> selected-meter-id: 0; in-out property <int> section: 0;
+    in property <[MeterRow]> meters; in property <[CmdRow]> commands;
+    in property <[EventRowLite]> events;
+    in property <bool> busy: false;
+
+    in-out property <string> cfg-gateway-id: ""; in-out property <string> cfg-gateway-sn: "";
+    in-out property <string> cfg-mqtt-host: ""; in-out property <string> cfg-mqtt-port: "1883";
+    in-out property <string> cfg-mqtt-user: ""; in-out property <string> cfg-mqtt-pass: "";
+    in-out property <int> edit-id: 0; in-out property <string> edit-sn: "";
+    in-out property <string> edit-addr: "1"; in-out property <string> edit-interval: "300";
+    in-out property <string> edit-profile: "PD666-3S3";
+
+    in property <[WifiRow]> wifi-networks; in property <bool> wifi-ok: false;
+    in property <string> wifi-status: "正在读取"; in property <string> wifi-ssid: "";
+    in property <int> wifi-signal: 0; in property <string> wifi-ipv4: "";
+    in property <string> wifi-gateway: ""; in property <string> wifi-dns: "";
+    in property <string> wifi-interface: ""; in-out property <string> wifi-selected-ssid: "";
+    in-out property <string> wifi-password: ""; in property <string> wifi-message: "";
+
+    in-out property <bool> dialog-open: false; in-out property <string> dialog-title: "操作提示";
+    in-out property <string> dialog-message: ""; in-out property <bool> dialog-danger: false;
+    in-out property <string> chart-tooltip: "移动到曲线查看设备数据";
+
+    callback nav-clicked(int); callback save-link(); callback diagnose-cloud(); callback save-meter();
+    callback new-meter(); callback delete-meter(int); callback read-now(int); callback refresh-logs();
+    callback wifi-scan(); callback wifi-select(int);
+    callback wifi-connect(); callback wifi-disconnect(); callback wifi-forget();
+
+    property <int> active-section: page == 3 ? 2 : (page >= 4 ? 3 : (page == 1 ? 1 : section));
+
+    VerticalLayout {
+        spacing: 0px;
+        Rectangle {
+            preferred-height: 90px; min-height: 86px; background: Theme.header; border-width: 1px; border-color: Theme.line;
+            HorizontalLayout {
+                padding-left: 22px; padding-right: 22px; spacing: 14px;
+                Image { width: 52px; height: 52px; source: @image-url("assets/gateway-logo.png"); image-fit: contain; }
+                VerticalLayout {
+                    width: 225px; alignment: center; spacing: 2px;
+                    Text { text: "智能AI采集边缘网关系统"; color: Theme.text; font-size: 16px; font-weight: 700; }
+                    Text { text: "EDGE GATEWAY · " + cfg-gateway-id; color: Theme.muted; font-size: 11px; }
+                }
+                Rectangle { width: 1px; height: 38px; background: Theme.line; }
+                TopNavItem { label: "运行总览"; code: "OVERVIEW"; index: 0; active: active-section; selected(i) => { section=i; nav-clicked(0); } }
+                TopNavItem { label: "设备采集"; code: "COLLECT"; index: 1; active: active-section; selected(i) => { section=i; nav-clicked(1); } }
+                TopNavItem { label: "上报中心"; code: "REPORT"; index: 2; active: active-section; selected(i) => { section=i; nav-clicked(3); } }
+                TopNavItem { label: "系统运维"; code: "SYSTEM"; index: 3; active: active-section; selected(i) => { section=i; nav-clicked(4); } }
+                Rectangle { }
+                HorizontalLayout { width: 120px; spacing: 8px; StatusDot { ok: cloud-ok; } Text { text: cloud-ok ? "平台在线" : "平台离线"; color: Theme.text; font-size: 13px; vertical-alignment: center; } }
+                Text { text: clock-text; color: clock-ok ? Theme.muted : Theme.red; font-size: 12px; vertical-alignment: center; }
+            }
+        }
+
+        HorizontalLayout {
+            padding: 14px; spacing: 14px;
+            Card {
+                preferred-width: 230px; min-width: 220px; background: #091c30;
+                VerticalLayout {
+                    padding: 12px; spacing: 8px;
+                    Text { text: active-section==0?"运行总览":(active-section==1?"设备采集":(active-section==2?"上报中心":"系统运维")); color: Theme.text; font-size: 18px; font-weight: 700; }
+                    Text { text: cfg-gateway-sn; color: Theme.muted; font-size: 11px; overflow: elide; }
+                    Rectangle { height: 1px; background: Theme.line; }
+                    if active-section==0: SideNavItem { label:"网关概览"; hint:"运行状态与快捷运维"; index:0; active:page; selected(i)=>{nav-clicked(0);} }
+                    if active-section==0: SideNavItem { label:"现场监控"; hint:"设备与实时测点"; index:1; active:page; selected(i)=>{section=1;nav-clicked(1);} }
+                    if active-section==1: SideNavItem { label:"设备监控"; hint:"RS485 设备与测点"; index:1; active:page; selected(i)=>{nav-clicked(1);} }
+                    if active-section==1: SideNavItem { label:"采集通道"; hint:"串口与链路状态"; index:2; active:page; selected(i)=>{channel-tab=0;nav-clicked(2);} }
+                    if active-section==2: SideNavItem { label:"数据上报"; hint:"Outbox 与转发记录"; index:3; active:page; selected(i)=>{nav-clicked(3);} }
+                    if active-section==2: SideNavItem { label:"指令接收"; hint:"平台下发与执行结果"; index:6; active:page; selected(i)=>{nav-clicked(3);} }
+                    if active-section==3: SideNavItem { label:"网络配置"; hint:"Wi-Fi 与 LAN"; index:2; active:page; selected(i)=>{channel-tab=1;section=3;nav-clicked(2);} }
+                    if active-section==3: SideNavItem { label:"平台配置"; hint:"MQTT 与网关身份"; index:7; active:page; selected(i)=>{channel-tab=2;section=3;nav-clicked(2);} }
+                    if active-section==3: SideNavItem { label:"告警与日志"; hint:"异常事件与诊断"; index:4; active:page; selected(i)=>{nav-clicked(4);} }
+                    Rectangle { }
+                    Rectangle {
+                        height: 82px; background: Theme.surface-2; border-radius: 8px;
+                        VerticalLayout { padding: 10px; spacing: 4px; Text{text:"本机运行";color:Theme.muted;font-size:12px;} Text{text:uptime;color:Theme.text;font-size:14px;font-weight:600;} Text{text:"v"+version;color:Theme.muted;font-size:11px;} }
+                    }
+                }
+            }
+
+            Rectangle { background: transparent; }
+        }
+    }
+
+    if page == 0: Rectangle { x:258px; y:104px; width:parent.width - 272px; height:parent.height - 118px;
+        VerticalLayout { spacing: 12px;
+            HorizontalLayout { height: 112px; spacing: 12px;
+                MetricCard { label:"设备在线"; value:meters-online+" / "+meters-total+" 台"; hint:meters-online==meters-total?"现场采集正常":"存在离线设备"; ok:meters-online==meters-total&&meters-total>0; }
+                MetricCard { label:"本地待上报"; value:outbox-pending+" 条"; hint:outbox-pending==0?"Outbox 无积压":"等待 MQTT 发布"; ok:outbox-pending==0; }
+                MetricCard { label:"今日电能"; value:today-kwh+" kWh"; hint:"全部设备汇总"; }
+                MetricCard { label:"平台连接"; value:cloud-ok?"正常":"异常"; hint:cloud-text; ok:cloud-ok; }
+            }
+            HorizontalLayout { spacing:12px;
+                Card { preferred-width: parent.width * 0.67; min-width: 590px; VerticalLayout { spacing:0px; SectionHeader{title:"最近24小时总有功功率";hint:"全部设备叠加";} Rectangle{height:1px;background:Theme.line;} Rectangle { clip:true;
+                    for y in [78px,142px,206px,270px]: Rectangle{x:50px;y:y;width:parent.width - 78px;height:1px;background:#163954;}
+                    Path{width:parent.width;height:parent.height;commands:"M 52 276 L 105 267 L 158 245 L 211 220 L 264 177 L 317 154 L 370 169 L 423 130 L 476 104 L 529 116 L 582 72 L 642 88";stroke:Theme.cyan;stroke-width:3px;fill:transparent;}
+                    Path{width:parent.width;height:parent.height;commands:"M 52 285 L 105 278 L 158 258 L 211 247 L 264 225 L 317 206 L 370 212 L 423 190 L 476 174 L 529 180";stroke:#587e99;stroke-width:2px;fill:transparent;}
+                    Text{x:52px;y:310px;text:"00:00";color:Theme.muted;font-size:12px;} Text{x:205px;y:310px;text:"06:00";color:Theme.muted;font-size:12px;} Text{x:360px;y:310px;text:"12:00";color:Theme.muted;font-size:12px;} Text{x:515px;y:310px;text:"18:00";color:Theme.muted;font-size:12px;}
+                    Rectangle{x:385px;y:18px;width:265px;height:42px;background:#071827;border-radius:6px;Text{x:10px;width:parent.width - 20px;text:chart-tooltip;color:Theme.text;font-size:13px;vertical-alignment:center;}}
+                    TouchArea{moved=>{chart-tooltip=meters.length>0?(meters[0].device-sn+" · 总有功 · "+meters[0].power-kw+" kW"):"暂无设备数据";}clicked=>{dialog-title="设备运行数据";dialog-message=chart-tooltip;dialog-open=true;}}
+                } } }
+                VerticalLayout { spacing:12px;
+                    Card { height:136px; VerticalLayout{padding:14px;spacing:8px;HorizontalLayout{StatusDot{ok:wifi-ok;}Text{text:wifi-ok?wifi-ssid:"Wi-Fi 未连接";color:Theme.text;font-size:17px;font-weight:700;vertical-alignment:center;}Rectangle{}Text{text:wifi-signal+"%";color:Theme.cyan;font-size:13px;vertical-alignment:center;}}Text{text:wifi-ok?(wifi-ipv4+" · "+wifi-interface):wifi-status;color:Theme.muted;font-size:13px;}ActionButton{text:"管理网络";clicked=>{section=3;channel-tab=1;nav-clicked(2);}}}}
+                    Card { height:158px; VerticalLayout{padding:14px;spacing:9px;Text{text:"快捷运维";color:Theme.text;font-size:17px;font-weight:700;}HorizontalLayout{spacing:8px;ActionButton{text:"立即采集";primary:true;clicked=>{if meters.length>0{read-now(meters[0].id);}}ActionButton{text:"链路诊断";clicked=>{diagnose-cloud();}}}HorizontalLayout{spacing:8px;ActionButton{text:"上报记录";clicked=>{section=2;nav-clicked(3);}}ActionButton{text:"告警日志";clicked=>{section=3;nav-clicked(4);}}}}}
+                    Card { VerticalLayout{spacing:0px;SectionHeader{title:"当前告警";hint:events.length+" 条";}Flickable{VerticalLayout{for e in events:Rectangle{height:42px;border-width:1px;border-color:Theme.line;HorizontalLayout{padding-left:12px;spacing:8px;StatusDot{ok:e.level=="INFO";}Text{text:e.source;width:90px;color:Theme.text;font-size:13px;vertical-alignment:center;}Text{text:e.message;color:e.level=="INFO"?Theme.muted:Theme.red;font-size:13px;vertical-alignment:center;overflow:elide;}}}}}}}
+                }
+            }
+        }
+    }
+
+    }
+    if page == 1: Rectangle { x:258px; y:104px; width:parent.width - 272px; height:parent.height - 118px;
+        HorizontalLayout{spacing:12px;Card{width:340px;VerticalLayout{spacing:0px;SectionHeader{title:"RS485 设备";hint:meters.length+" 台";}Rectangle{height:1px;background:Theme.line;}Flickable{VerticalLayout{for m in meters:Rectangle{height:64px;background:selected-meter-id==m.id?#123f64:transparent;border-width:1px;border-color:Theme.line;HorizontalLayout{padding-left:13px;padding-right:11px;spacing:10px;StatusDot{ok:m.online;}VerticalLayout{alignment:center;Text{text:m.device-sn;color:Theme.text;font-size:15px;font-weight:700;}Text{text:m.profile+" · 地址 "+m.addr;color:Theme.muted;font-size:12px;}}Rectangle{}Text{text:m.online?"在线":"离线";color:m.online?Theme.green:Theme.red;font-size:13px;vertical-alignment:center;}TouchArea{clicked=>{selected-meter-id=m.id;edit-id=m.id;edit-sn=m.device-sn;edit-addr=m.addr;edit-interval=m.interval;edit-profile=m.profile;}}}}}}}Card{VerticalLayout{spacing:0px;SectionHeader{title:"设备实时测点";hint:"右侧可滚动";}Rectangle{height:1px;background:Theme.line;}Flickable{VerticalLayout{Rectangle{height:38px;background:Theme.surface-2;HorizontalLayout{padding-left:15px;Text{text:"设备";width:210px;color:Theme.muted;font-size:13px;vertical-alignment:center;}Text{text:"电压";width:150px;color:Theme.muted;font-size:13px;vertical-alignment:center;}Text{text:"电流";width:150px;color:Theme.muted;font-size:13px;vertical-alignment:center;}Text{text:"总有功";width:155px;color:Theme.muted;font-size:13px;vertical-alignment:center;}Text{text:"采集时间";color:Theme.muted;font-size:13px;vertical-alignment:center;}}}for m in meters:Rectangle{height:49px;border-width:1px;border-color:Theme.line;HorizontalLayout{padding-left:15px;Text{text:m.device-sn;width:210px;color:Theme.text;font-size:14px;vertical-alignment:center;}Text{text:m.voltage-a+" V";width:150px;color:Theme.text;font-size:14px;vertical-alignment:center;}Text{text:m.current-a+" A";width:150px;color:Theme.text;font-size:14px;vertical-alignment:center;}Text{text:m.power-kw+" kW";width:155px;color:Theme.cyan;font-size:14px;vertical-alignment:center;}Text{text:m.last-read;color:m.online?Theme.muted:Theme.red;font-size:13px;vertical-alignment:center;}}}}Rectangle{height:58px;HorizontalLayout{padding-left:14px;spacing:8px;ActionButton{text:"新增设备";clicked=>{new-meter();}}ActionButton{text:"保存档案";primary:true;clicked=>{save-meter();}}ActionButton{text:"立即读取";clicked=>{if edit-id!=0{read-now(edit-id);}}}}}}}}
+    }
+
+    }
+    }
+    if page == 2 && channel-tab == 0: Rectangle { x:258px; y:104px; width:parent.width - 272px; height:parent.height - 118px;
+        Card{VerticalLayout{spacing:0px;SectionHeader{title:"采集通道";hint:"RS485 / Modbus RTU";}Rectangle{height:1px;background:Theme.line;}HorizontalLayout{padding:20px;spacing:18px;VerticalLayout{spacing:8px;Text{text:"RS485-1";color:Theme.text;font-size:20px;font-weight:700;}InfoRow{label:"设备文件";value:"/dev/ttyS3";}InfoRow{label:"串口参数";value:"9600 · 8N1";}InfoRow{label:"协议";value:"Modbus RTU";}InfoRow{label:"超时 / 重试";value:"800 ms / 2 次";}InfoRow{label:"在线设备";value:meters-online+" / "+meters-total+" 台";ok:meters-online==meters-total;}Rectangle{}HorizontalLayout{spacing:10px;ActionButton{text:"一键运行";primary:true;clicked=>{dialog-title="采集通道";dialog-message="采集服务正在运行。";dialog-open=true;}}ActionButton{text:"安全断开";danger:true;clicked=>{dialog-title="安全断开";dialog-message="停止前会保留本地 Outbox 数据。";dialog-danger=true;dialog-open=true;}}}}Card{width:360px;background:Theme.surface-2;VerticalLayout{padding:16px;spacing:7px;Text{text:"链路状态";color:Theme.text;font-size:18px;font-weight:700;}InfoRow{label:"RS485";value:meters-online>0?"正常":"异常";ok:meters-online>0;}InfoRow{label:"MQTT";value:cloud-text;ok:cloud-ok;}InfoRow{label:"待上报";value:outbox-pending+" 条";ok:outbox-pending==0;}InfoRow{label:"最后发布";value:last-publish;}Rectangle{}ActionButton{text:"执行链路诊断";clicked=>{diagnose-cloud();}}}}}}}
+    }
+
+    if page == 2 && channel-tab == 1: Rectangle { x:258px; y:104px; width:parent.width - 272px; height:parent.height - 118px;
+        VerticalLayout{spacing:12px;Card{height:66px;HorizontalLayout{padding-left:16px;padding-right:14px;Text{text:"网络配置";color:Theme.text;font-size:19px;font-weight:700;vertical-alignment:center;}Text{text:"首次配置 LAN 与 Wi-Fi；不会自动切换已稳定运行的链路";color:Theme.muted;font-size:12px;vertical-alignment:center;}Rectangle{}ActionButton{text:"扫描网络";clicked=>{wifi-scan();}}}}HorizontalLayout{height:92px;spacing:12px;Card{background:wifi-ok?#104461:Theme.surface;HorizontalLayout{padding-left:18px;padding-right:18px;spacing:12px;StatusDot{ok:wifi-ok;}VerticalLayout{alignment:center;Text{text:"Wi-Fi";color:Theme.text;font-size:18px;font-weight:700;}Text{text:wifi-ok?("已连接 · "+wifi-ssid):wifi-status;color:wifi-ok?Theme.green:Theme.muted;font-size:13px;}}Rectangle{}Text{text:wifi-signal+"%";color:Theme.cyan;font-size:16px;vertical-alignment:center;}}}Card{HorizontalLayout{padding-left:18px;spacing:12px;StatusDot{ok:wifi-ipv4!="";}VerticalLayout{alignment:center;Text{text:"LAN / IP";color:Theme.text;font-size:18px;font-weight:700;}Text{text:wifi-ipv4==""?"未获取地址":wifi-ipv4;color:Theme.muted;font-size:13px;}}}}}Card{VerticalLayout{padding:16px;spacing:12px;HorizontalLayout{spacing:12px;Card{width:280px;height:74px;background:wifi-ok?#105168:Theme.surface-2;border-color:wifi-ok?Theme.cyan:Theme.line;VerticalLayout{padding:10px;Text{text:wifi-ok?"Wi-Fi 已连接":"Wi-Fi 未连接";color:Theme.text;font-size:17px;font-weight:700;}Text{text:wifi-ok?(wifi-interface+" · "+wifi-ssid):wifi-message;color:Theme.muted;font-size:12px;overflow:elide;}}}Field{label:"Wi-Fi 名称";value<=>wifi-selected-ssid;}Field{width:230px;label:"Wi-Fi 密码";value<=>wifi-password;}}HorizontalLayout{height:46px;spacing:10px;ActionButton{text:"连接";primary:true;clicked=>{wifi-connect();}}ActionButton{text:"断开";clicked=>{wifi-disconnect();}}ActionButton{text:"忘记网络";danger:true;clicked=>{wifi-forget();}}Text{text:wifi-message;color:Theme.muted;font-size:13px;vertical-alignment:center;overflow:elide;}}Rectangle{height:1px;background:Theme.line;}Text{text:"可用网络";color:Theme.text;font-size:15px;font-weight:700;}Flickable{VerticalLayout{for n[i] in wifi-networks:Rectangle{height:42px;background:n.connected?#113f59:transparent;border-width:1px;border-color:Theme.line;HorizontalLayout{padding-left:12px;StatusDot{ok:n.connected;}Text{text:n.ssid;width:280px;color:Theme.text;font-size:14px;vertical-alignment:center;}Text{text:n.signal+"%";width:100px;color:Theme.cyan;font-size:13px;vertical-alignment:center;}Text{text:n.security;color:Theme.muted;font-size:13px;vertical-alignment:center;}TouchArea{clicked=>{wifi-select(i);}}}}}}}}}
+    }
+
+    if page == 2 && channel-tab == 2: Rectangle { x:258px; y:104px; width:parent.width - 272px; height:parent.height - 118px;
+        Card{VerticalLayout{spacing:0px;SectionHeader{title:"平台配置";hint:"MQTT 上报与网关身份";}Rectangle{height:1px;background:Theme.line;}HorizontalLayout{padding:20px;spacing:22px;VerticalLayout{spacing:12px;HorizontalLayout{spacing:12px;Field{label:"MQTT 地址";value<=>cfg-mqtt-host;}Field{width:150px;label:"端口";value<=>cfg-mqtt-port;}}HorizontalLayout{spacing:12px;Field{label:"网关编号";value<=>cfg-gateway-id;}Field{label:"网关序列号";value<=>cfg-gateway-sn;}}HorizontalLayout{spacing:12px;Field{label:"用户名";value<=>cfg-mqtt-user;}Field{label:"密码";value<=>cfg-mqtt-pass;}}Rectangle{}HorizontalLayout{spacing:10px;ActionButton{text:"链路诊断";clicked=>{diagnose-cloud();}}ActionButton{text:"保存并应用";primary:true;clicked=>{save-link();dialog-title="平台配置";dialog-message="配置已保存，连接参数将在网关重连后生效。";dialog-open=true;}}}}Card{width:350px;background:Theme.surface-2;VerticalLayout{padding:16px;spacing:8px;Text{text:"当前连接";color:Theme.text;font-size:18px;font-weight:700;}InfoRow{label:"云平台";value:cloud-text;ok:cloud-ok;}InfoRow{label:"待上报";value:outbox-pending+" 条";ok:outbox-pending==0;}InfoRow{label:"累计成功";value:outbox-sent+" 条";}InfoRow{label:"最后发布";value:last-publish;}InfoRow{label:"系统时钟";value:clock-text;ok:clock-ok;}}}}}}
+    }
+
+    if page == 3: Rectangle { x:258px; y:104px; width:parent.width - 272px; height:parent.height - 118px;
+        VerticalLayout{spacing:12px;HorizontalLayout{height:102px;spacing:12px;MetricCard{label:"MQTT";value:cloud-ok?"在线":"离线";hint:cloud-text;ok:cloud-ok;}MetricCard{label:"Outbox";value:outbox-pending+" 条";hint:"待发布队列";ok:outbox-pending==0;}MetricCard{label:"累计成功";value:outbox-sent+" 条";hint:"DATA_UPLOAD";}MetricCard{label:"最后发布";value:last-publish;hint:"网关本地时间";}}Card{height:270px;VerticalLayout{spacing:0px;SectionHeader{title:"数据上报记录";hint:"DATA_UPLOAD / FORWARDED";}Rectangle{height:1px;background:Theme.line;}Flickable{VerticalLayout{for m in meters:Rectangle{height:46px;border-width:1px;border-color:Theme.line;HorizontalLayout{padding-left:14px;Text{text:last-publish;width:105px;color:Theme.muted;font-size:13px;vertical-alignment:center;}Text{text:m.device-sn;width:210px;color:Theme.text;font-size:14px;vertical-alignment:center;}Text{text:"标准测点";width:120px;color:Theme.text;font-size:13px;vertical-alignment:center;}Text{text:m.online?"DATA_UPLOAD":"WAITING";width:150px;color:m.online?Theme.green:Theme.amber;font-size:13px;vertical-alignment:center;}Text{text:m.online?"FORWARDED":"未采集";color:m.online?Theme.cyan:Theme.red;font-size:13px;vertical-alignment:center;}}}}}}}Card{VerticalLayout{spacing:0px;SectionHeader{title:"指令接收";hint:"CMD_DOWN · 平台下发";}Rectangle{height:1px;background:Theme.line;}Flickable{VerticalLayout{for c in commands:Rectangle{height:44px;border-width:1px;border-color:Theme.line;HorizontalLayout{padding-left:14px;Text{text:c.command-id;width:220px;color:Theme.text;font-size:13px;vertical-alignment:center;overflow:elide;}Text{text:c.command-type;width:170px;color:Theme.text;font-size:13px;vertical-alignment:center;}Text{text:c.status;width:120px;color:c.status=="SUCCESS"||c.status=="OK"?Theme.green:Theme.red;font-size:13px;vertical-alignment:center;}Text{text:c.message;color:Theme.muted;font-size:13px;vertical-alignment:center;overflow:elide;}}}}}}}}
+    }
+
+    if page == 4: Rectangle { x:258px; y:104px; width:parent.width - 272px; height:parent.height - 118px;
+        HorizontalLayout{spacing:12px;Card{preferred-width:parent.width * 0.61;min-width:540px;VerticalLayout{spacing:0px;SectionHeader{title:"告警与运行日志";hint:"最近事件";}Rectangle{height:1px;background:Theme.line;}Flickable{VerticalLayout{for e in events:Rectangle{height:48px;border-width:1px;border-color:Theme.line;HorizontalLayout{padding-left:14px;spacing:9px;StatusDot{ok:e.level=="INFO";}Text{text:e.time;width:92px;color:Theme.muted;font-size:13px;vertical-alignment:center;}Text{text:e.source;width:125px;color:Theme.text;font-size:13px;vertical-alignment:center;}Text{text:e.message;color:e.level=="INFO"?Theme.muted:Theme.red;font-size:13px;vertical-alignment:center;overflow:elide;}}}}}}}Card{VerticalLayout{spacing:0px;SectionHeader{title:"网关系统信息";hint:"本机状态";}Rectangle{height:1px;background:Theme.line;}VerticalLayout{padding:16px;spacing:4px;InfoRow{label:"网关编号";value:cfg-gateway-sn;}InfoRow{label:"软件版本";value:version;}InfoRow{label:"服务运行";value:uptime;}InfoRow{label:"系统时钟";value:clock-text;ok:clock-ok;}InfoRow{label:"本地队列";value:outbox-pending+" 条";ok:outbox-pending==0;}InfoRow{label:"Wi-Fi";value:wifi-ok?wifi-ssid:"未连接";ok:wifi-ok;}Rectangle{}HorizontalLayout{spacing:10px;ActionButton{text:"刷新日志";clicked=>{refresh-logs();}}ActionButton{text:"网络设置";primary:true;clicked=>{section=3;channel-tab=1;nav-clicked(2);}}}}}}}
+    }
+
+    if dialog-open: Rectangle {
+        x:0px; y:0px; width:parent.width; height:parent.height; background:#020812c2;
+        Rectangle {
+            x:(parent.width - 470px) * 0.5; y:(parent.height - 238px) * 0.5; width:470px; height:238px;
+            background:#0d2945; border-width:1px; border-color:dialog-danger?Theme.red:Theme.cyan; border-radius:10px;
+            VerticalLayout { padding:22px; spacing:13px;
+                Text{text:dialog-title;color:dialog-danger?Theme.red:Theme.text;font-size:20px;font-weight:700;}
+                Text{text:dialog-message;color:Theme.muted;font-size:15px;wrap:word-wrap;}
+                Rectangle{}
+                HorizontalLayout{Rectangle{}ActionButton{text:"关闭";primary:true;clicked=>{dialog-open=false;dialog-danger=false;}}}
+            }
+        }
+    }
+}
+

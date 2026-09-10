@@ -1,0 +1,13 @@
+[package]
+name = "gw-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "纯领域逻辑：outbox 语义、能量单调规则、时钟安全策略、指令语义（零 IO 依赖，PC 可全量单测）"
+
+[dependencies]
+gw-proto = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

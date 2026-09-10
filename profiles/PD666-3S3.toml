@@ -1,0 +1,93 @@
+# PD666-3S3 交流电表寄存器档案（Modbus RTU，保持寄存器）
+# name 必须与 meter.profile 字段一致；point 键与上报报文 points 一致，
+# 云侧 dev_point_mapping.source_path（$.xxx）据此映射为标准测点。
+# data_type: u16 | u32 | i32（u32/i32 高字在前）；物理值 = 原始值 × scale + offset
+
+name = "PD666-3S3"
+description = "WZBC-LS2-M-325/326 交流电表采集模板，9600 8N1，按平台物模型映射采集"
+device_type_codes = ["PD666-3S3"]
+
+[[register]]
+point = "voltage_a"
+address = 0
+quantity = 2
+data_type = "u32"
+scale = 0.1
+
+[[register]]
+point = "voltage_b"
+address = 2
+quantity = 2
+data_type = "u32"
+scale = 0.1
+
+[[register]]
+point = "voltage_c"
+address = 4
+quantity = 2
+data_type = "u32"
+scale = 0.1
+
+[[register]]
+point = "current_a"
+address = 6
+quantity = 2
+data_type = "u32"
+scale = 0.001
+
+[[register]]
+point = "current_b"
+address = 8
+quantity = 2
+data_type = "u32"
+scale = 0.001
+
+[[register]]
+point = "current_c"
+address = 10
+quantity = 2
+data_type = "u32"
+scale = 0.001
+
+[[register]]
+point = "active_power_total"
+address = 18
+quantity = 2
+data_type = "i32"
+scale = 0.01
+
+[[register]]
+point = "reactive_power_total"
+address = 22
+quantity = 2
+data_type = "i32"
+scale = 0.01
+
+[[register]]
+point = "apparent_power_total"
+address = 26
+quantity = 2
+data_type = "i32"
+scale = 0.01
+
+[[register]]
+point = "power_factor_total"
+address = 41
+quantity = 1
+data_type = "u16"
+scale = 0.001
+
+[[register]]
+point = "frequency"
+address = 70
+quantity = 1
+data_type = "u16"
+scale = 0.01
+
+[[register]]
+point = "forward_active_energy"
+address = 256
+quantity = 2
+data_type = "u32"
+scale = 0.01
+

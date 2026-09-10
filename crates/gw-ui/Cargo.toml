@@ -1,0 +1,34 @@
+[package]
+name = "gw-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Slint 触屏 UI + 网关主二进制（tokio 后台线程 + Slint 主线程事件循环）"
+
+[[bin]]
+name = "park-gateway"
+path = "src/main.rs"
+
+[dependencies]
+gw-proto = { workspace = true }
+gw-core = { workspace = true }
+gw-store = { workspace = true }
+gw-collector = { workspace = true }
+gw-link = { workspace = true }
+gw-agent = { workspace = true }
+gw-network = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+slint = { workspace = true, features = ["backend-winit", "renderer-femtovg", "compat-1-2"] }
+
+[build-dependencies]
+slint-build = { workspace = true }
+
+[features]
+# 无 GPU 驱动时的兜底渲染（Panfrost 不可用时启用）
+software-renderer = ["slint/renderer-software"]

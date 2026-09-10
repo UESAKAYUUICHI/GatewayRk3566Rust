@@ -1,0 +1,55 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/gw-proto",
+    "crates/gw-core",
+    "crates/gw-store",
+    "crates/gw-collector",
+    "crates/gw-link",
+    "crates/gw-agent",
+    "crates/gw-network",
+    "crates/gw-web",
+    "crates/gw-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+gw-proto = { path = "crates/gw-proto" }
+gw-core = { path = "crates/gw-core" }
+gw-store = { path = "crates/gw-store" }
+gw-collector = { path = "crates/gw-collector" }
+gw-link = { path = "crates/gw-link" }
+gw-agent = { path = "crates/gw-agent" }
+gw-network = { path = "crates/gw-network" }
+gw-web = { path = "crates/gw-web" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+async-trait = "0.1"
+tokio-util = "0.7"
+slint = "1.13"
+slint-build = "1.13"
+toml = "0.8"
+rusqlite = { version = "0.37", features = ["bundled"] }
+rumqttc = "0.24"
+tokio-modbus = "0.16"
+tokio-serial = "5.1"
+axum = { version = "0.8", features = ["ws", "json"] }
+tower-http = { version = "0.6", features = ["fs", "cors", "trace"] }
+futures-util = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1

@@ -1,0 +1,26 @@
+[Unit]
+Description=Park Energy Gateway (RK3568, Rust)
+After=network-online.target systemd-timesyncd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=parkgw
+Group=dialout
+SupplementaryGroups=netdev
+ExecStart=/usr/bin/gateway-web --config /etc/park-gateway/gateway.toml --web-root /usr/share/park-gateway/web-ui --bind 0.0.0.0:8080
+WorkingDirectory=/var/lib/park-gateway
+Restart=always
+RestartSec=3
+# 程序尚未实现 systemd sd_notify，不能设置 WatchdogSec；否则 systemd 会在
+# 30 秒后误判健康进程超时并不断重启。Restart=always 仍会处理进程退出。
+
+# 硬化项
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/park-gateway
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

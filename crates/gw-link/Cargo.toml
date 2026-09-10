@@ -1,0 +1,18 @@
+[package]
+name = "gw-link"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "云链路端口：CloudLink trait + MQTT(rumqttc, QoS1) 实现"
+
+[features]
+default = ["mqtt"]
+mqtt = ["dep:rumqttc"]
+
+[dependencies]
+gw-core = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+rumqttc = { workspace = true, optional = true }

@@ -1,0 +1,25 @@
+# 冒烟/联调用配置：本地库 + 短采集周期
+tz_offset_s = 28800
+db_path = "D:/Code/EC-EnergySys/GatewayRk3566Rust/smoke.db"
+profiles_dir = "./profiles"
+
+[cloud]
+gateway_id = "3"
+gateway_sn = "WZBC-LS2-GW-03"
+mqtt_host = "127.0.0.1"
+mqtt_port = 1883
+heartbeat_s = 30
+report_interval_s = 300
+data_interval_s = 2
+
+[serial]
+port = "/dev/ttyS3"
+baud = 9600
+
+[[meter]]
+device_sn = "WZBC-LS2-M-325"
+modbus_addr = 1
+profile = "PD666-3S3"
+collect_interval_s = 2
+enabled = true
+

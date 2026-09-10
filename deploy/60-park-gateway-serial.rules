@@ -1,0 +1,5 @@
+# RS485 串口设备授权：parkgw 用户可读写
+# USB 转 485
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", MODE="0660", GROUP="dialout", SYMLINK+="rs485-usb"
+# RK3566 板载 UART 扩展（按实际设备树节点调整）
+KERNEL=="ttyS[0-9]*", SUBSYSTEM=="tty", MODE="0660", GROUP="dialout"

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Park Gateway Fullscreen UI
+Comment=Open Park Gateway Web UI in fullscreen kiosk mode
+Exec=/usr/local/bin/park-gateway-kiosk
+Terminal=false
+Hidden=false
+X-GNOME-Autostart-enabled=true

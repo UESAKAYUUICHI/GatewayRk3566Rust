@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export DISPLAY="${DISPLAY:-:0}"
+export HOME="${HOME:-/home/kickpi}"
+export XAUTHORITY="${XAUTHORITY:-/home/kickpi/.Xauthority}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/1000}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/1000/bus}"
+
+URL="${PARK_GATEWAY_KIOSK_URL:-http://127.0.0.1:8080/}"
+PROFILE_DIR="${PARK_GATEWAY_KIOSK_PROFILE:-/home/kickpi/.cache/park-gateway-kiosk}"
+mkdir -p "$PROFILE_DIR"
+mkdir -p "$PROFILE_DIR/Default"
+cat >"$PROFILE_DIR/Default/Preferences" <<'EOF'
+{
+  "translate": {
+    "enabled": false
+  }
+}
+EOF
+
+xset s off -dpms s noblank 2>/dev/null || true
+xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/blank-on-ac -s 0 2>/dev/null || true
+xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/dpms-enabled -s false 2>/dev/null || true
+xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/lock-screen-suspend-hibernate -s false 2>/dev/null || true
+xfconf-query -c xfce4-screensaver -p /lock/enabled -s false 2>/dev/null || true
+xfconf-query -c xfce4-screensaver -p /saver/enabled -s false 2>/dev/null || true
+pkill -u "$(id -un)" -f 'xfce4-screensaver|light-locker|xscreensaver|gnome-screensaver' 2>/dev/null || true
+
+for _ in $(seq 1 60); do
+  if curl -fsS --max-time 1 http://127.0.0.1:8080/api/v1/health >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+pkill -u "$(id -un)" -f 'chromium.*park-gateway-kiosk' 2>/dev/null || true
+rm -f "$PROFILE_DIR/SingletonCookie" "$PROFILE_DIR/SingletonLock" "$PROFILE_DIR/SingletonSocket" 2>/dev/null || true
+exec /usr/bin/chromium \
+  --user-data-dir="$PROFILE_DIR" \
+  --class=park-gateway-kiosk \
+  --kiosk \
+  --start-fullscreen \
+  --start-maximized \
+  --window-size=800,1280 \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-debugging-port=9222 \
+  --no-first-run \
+  --no-default-browser-check \
+  --password-store=basic \
+  --disable-background-networking \
+  --disable-session-crashed-bubble \
+  --disable-infobars \
+  --disable-extensions \
+  --disable-component-extensions-with-background-pages \
+  --disable-features=Translate,TranslateUI,OverscrollHistoryNavigation,TouchpadOverscrollHistoryNavigation,PullToRefresh \
+  --disable-translate \
+  --disable-pinch \
+  --ignore-gpu-blocklist \
+  --enable-gpu-rasterization \
+  --enable-zero-copy \
+  --disable-dev-shm-usage \
+  --no-sandbox \
+  --noerrdialogs \
+  --disk-cache-size=1 \
+  --media-cache-size=1 \
+  --overscroll-history-navigation=0 \
+  --check-for-update-interval=31536000 \
+  "$URL"

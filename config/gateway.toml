@@ -1,0 +1,48 @@
+# 园区能源网关引导配置（三层合并的第二层：内置默认 < 本文件 < 运行时数据库）
+#
+# !! 注意：TOML 中位于 [section] 之后的键属于该 section。
+#    因此所有顶层键（tz_offset_s / db_path / profiles_dir）必须写在任何 [section] 之前！
+
+# ---- 顶层键（必须位于所有 [section] 之前）----
+
+# 时区偏移秒（东八区），用于本地日用电归属
+tz_offset_s = 28800
+
+# SQLite 数据文件
+db_path = "/var/lib/park-gateway/gateway.db"
+
+# 寄存器档案目录（启动时导入 meter_register_map 表）
+profiles_dir = "/usr/share/park-gateway/profiles"
+
+# ---- 云端对接 ----
+# gateway_id → dev_gateway.id（MQTT topic 中的网关 ID）
+# gateway_sn → dev_gateway.gateway_sn
+# mqtt_username/password → EMQX 认证（建议 username=gateway_sn，password=dev_gateway.mqtt_secret）
+[cloud]
+gateway_id = "3"
+gateway_sn = "WZBC-LS2-GW-03"
+mqtt_host = "115.159.222.238"
+mqtt_port = 1883
+mqtt_username = "WZBC-LS2-GW-03"
+mqtt_password = "07fd51d6922911f1b0c7525400037653"
+platform_http_url = "http://115.159.222.238:8103"
+# 心跳周期（秒）：平台连续缺失 3 个周期（90 秒）后判离线
+heartbeat_s = 30
+# 真实采样每 5 分钟汇总为一个可靠上报批次
+report_interval_s = 300
+# 默认采集周期（秒）
+data_interval_s = 300
+
+# ---- 串口通道（真驱动使用） ----
+[serial]
+# 按板端实际设备填写：普通 UART 常见为 /dev/ttyS0、/dev/ttyS1；
+# USB 转串口或 USB-485 常见为 /dev/ttyUSB0。Web UI 可继续新增/修改通道。
+port = "/dev/ttyS3"
+baud = 9600
+data_bits = 8
+stop_bits = 1
+parity = "NONE"
+
+# ---- 设备档案 ----
+# 生产配置不内置示例电表。请在网关 Web UI 或平台同步真实设备档案后采集。
+

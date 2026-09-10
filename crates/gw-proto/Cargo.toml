@@ -1,0 +1,10 @@
+[package]
+name = "gw-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "与 park-energy-access 严格对齐的报文协议模型（主题、payload、messageId 规则）"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
