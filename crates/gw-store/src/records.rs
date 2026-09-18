@@ -44,11 +44,29 @@ pub struct RegisterMapRow {
     pub func: u8,
     pub address: u16,
     pub quantity: u16,
+    /// Field location within the shared read block.
+    pub field_offset: u16,
+    pub field_quantity: u16,
+    pub bit_offset: Option<u8>,
+    pub bit_length: Option<u8>,
     pub data_type: String,
     /// Register byte/word order, for example ABCD/BADC/CDAB/DCBA.
     pub byte_order: String,
     pub scale: f64,
     pub offset: f64,
+}
+
+/// A write operation published with a protocol version. Only these rows may reach the fieldbus.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProtocolCommandRow {
+    pub profile: String,
+    pub command_code: String,
+    pub command_name: String,
+    pub function_code: u8,
+    pub register_address: u16,
+    pub encode_type: String,
+    pub fixed_value: Option<u16>,
+    pub parameter_json: Option<String>,
 }
 
 /// 每次真实采样的历史行；在成功归入 outbox 前一直保持 `outbox_id = NULL`。
@@ -74,11 +92,18 @@ pub struct SampleRecord {
 pub struct Rs485ChannelRecord {
     pub id: String,
     pub name: String,
+    /// 当前网关仅实现 MODBUS_RTU，字段保留用于拒绝不支持的协议。
+    pub protocol: String,
     pub port: String,
     pub baud: u32,
     pub data_bits: u8,
     pub stop_bits: u8,
     pub parity: String,
+    pub timeout_ms: u64,
+    pub retry_count: u32,
+    pub poll_interval_s: u64,
+    /// LOCAL | PLATFORM
+    pub config_source: String,
     pub enabled: bool,
 }
 
@@ -126,6 +151,23 @@ pub struct SyncedThingModel {
     pub version: String,
     pub platform_model_id: i64,
     pub points: Vec<RegisterMapRow>,
+    pub commands: Vec<ProtocolCommandRow>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncedChannel {
+    pub channel_id: String,
+    pub channel_name: String,
+    pub protocol: String,
+    pub serial_port: String,
+    pub baud_rate: u32,
+    pub data_bits: u8,
+    pub stop_bits: u8,
+    pub parity: String,
+    pub timeout_ms: u64,
+    pub retry_count: u32,
+    pub poll_interval_s: u64,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +211,19 @@ pub struct OutboxItem {
     pub payload: Vec<u8>,
     pub created_ms: u64,
     pub attempts: u32,
+}
+
+/// outbox 历史行（展示视角）。
+#[derive(Debug, Clone)]
+pub struct OutboxRecord {
+    pub id: i64,
+    pub message_id: String,
+    pub topic: String,
+    pub payload: Vec<u8>,
+    pub created_ms: u64,
+    pub status: String,
+    pub attempts: u32,
+    pub last_error: Option<String>,
 }
 
 /// 最新读数快照。

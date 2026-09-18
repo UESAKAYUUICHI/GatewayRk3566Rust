@@ -218,6 +218,35 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE meter_register_map ADD COLUMN byte_order TEXT NOT NULL DEFAULT 'ABCD';
     ",
+    // v10：平台通道成为可同步资源，并保存运行时真正使用的超时、重试和默认周期。
+    "
+    ALTER TABLE rs485_channel ADD COLUMN protocol TEXT NOT NULL DEFAULT 'MODBUS_RTU';
+    ALTER TABLE rs485_channel ADD COLUMN timeout_ms INTEGER NOT NULL DEFAULT 1000;
+    ALTER TABLE rs485_channel ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 2;
+    ALTER TABLE rs485_channel ADD COLUMN poll_interval_s INTEGER NOT NULL DEFAULT 300;
+    ALTER TABLE rs485_channel ADD COLUMN config_source TEXT NOT NULL DEFAULT 'LOCAL';
+    ",
+    // v11: mapping rows reference shared read blocks and may decode bit fields.
+    "
+    ALTER TABLE meter_register_map ADD COLUMN field_offset INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE meter_register_map ADD COLUMN field_quantity INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE meter_register_map ADD COLUMN bit_offset INTEGER;
+    ALTER TABLE meter_register_map ADD COLUMN bit_length INTEGER;
+    ",
+    // v12: protocol-version command whitelist used by controlled fieldbus writes.
+    "
+    CREATE TABLE protocol_command (
+        profile          TEXT NOT NULL,
+        command_code     TEXT NOT NULL,
+        command_name     TEXT NOT NULL,
+        function_code    INTEGER NOT NULL,
+        register_address INTEGER NOT NULL,
+        encode_type      TEXT NOT NULL,
+        fixed_value      INTEGER,
+        parameter_json   TEXT,
+        PRIMARY KEY(profile, command_code)
+    );
+    ",
 ];
 
 /// SQLite 存储门面。`Send` 但内部以 Mutex 串行化（短临界区）。
@@ -287,19 +316,26 @@ impl Store {
     pub fn channels(&self) -> StoreResult<Vec<Rs485ChannelRecord>> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id,name,port,baud,data_bits,stop_bits,parity,enabled FROM rs485_channel ORDER BY id",
+            "SELECT id,name,protocol,port,baud,data_bits,stop_bits,parity,timeout_ms,retry_count,
+                    poll_interval_s,config_source,enabled
+             FROM rs485_channel ORDER BY id",
         )?;
         Ok(stmt
             .query_map([], |r| {
                 Ok(Rs485ChannelRecord {
                     id: r.get(0)?,
                     name: r.get(1)?,
-                    port: r.get(2)?,
-                    baud: r.get::<_, i64>(3)? as u32,
-                    data_bits: r.get::<_, i64>(4)? as u8,
-                    stop_bits: r.get::<_, i64>(5)? as u8,
-                    parity: r.get(6)?,
-                    enabled: r.get::<_, i64>(7)? == 1,
+                    protocol: r.get(2)?,
+                    port: r.get(3)?,
+                    baud: r.get::<_, i64>(4)? as u32,
+                    data_bits: r.get::<_, i64>(5)? as u8,
+                    stop_bits: r.get::<_, i64>(6)? as u8,
+                    parity: r.get(7)?,
+                    timeout_ms: r.get::<_, i64>(8)? as u64,
+                    retry_count: r.get::<_, i64>(9)? as u32,
+                    poll_interval_s: r.get::<_, i64>(10)? as u64,
+                    config_source: r.get(11)?,
+                    enabled: r.get::<_, i64>(12)? == 1,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?)
@@ -321,12 +357,16 @@ impl Store {
     pub fn upsert_channel(&self, row: &Rs485ChannelRecord, now_ms: u64) -> StoreResult<()> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         conn.execute(
-            "INSERT INTO rs485_channel(id,name,port,baud,data_bits,stop_bits,parity,enabled,updated_ms)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
-             ON CONFLICT(id) DO UPDATE SET name=excluded.name,port=excluded.port,baud=excluded.baud,
-               data_bits=excluded.data_bits,stop_bits=excluded.stop_bits,parity=excluded.parity,
+            "INSERT INTO rs485_channel(id,name,protocol,port,baud,data_bits,stop_bits,parity,timeout_ms,
+                retry_count,poll_interval_s,config_source,enabled,updated_ms)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name,protocol=excluded.protocol,port=excluded.port,
+               baud=excluded.baud,data_bits=excluded.data_bits,stop_bits=excluded.stop_bits,
+               parity=excluded.parity,timeout_ms=excluded.timeout_ms,retry_count=excluded.retry_count,
+               poll_interval_s=excluded.poll_interval_s,config_source=excluded.config_source,
                enabled=excluded.enabled,updated_ms=excluded.updated_ms",
-            params![row.id,row.name,row.port,row.baud,row.data_bits,row.stop_bits,row.parity,row.enabled as i64,now_ms as i64],
+            params![row.id,row.name,row.protocol,row.port,row.baud,row.data_bits,row.stop_bits,row.parity,
+                row.timeout_ms,row.retry_count,row.poll_interval_s,row.config_source,row.enabled as i64,now_ms as i64],
         )?;
         Ok(())
     }
@@ -622,12 +662,65 @@ impl Store {
     pub fn apply_platform_sync(
         &self,
         revision: &str,
+        channels: &[SyncedChannel],
         models: &[SyncedThingModel],
         devices: &[SyncedDevice],
         now_ms: u64,
     ) -> StoreResult<()> {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
+        let mut channel_ids = std::collections::HashSet::new();
+        let mut enabled_ports = std::collections::HashSet::new();
+        for channel in channels {
+            let id = channel.channel_id.trim();
+            let protocol = channel.protocol.trim().to_ascii_uppercase();
+            let port = channel.serial_port.trim();
+            if id.is_empty() || port.is_empty() {
+                return Err(StoreError::Validation("platform channel id and serial port are required".into()));
+            }
+            if protocol != "MODBUS_RTU" {
+                return Err(StoreError::Validation(format!(
+                    "channel {} uses unsupported protocol {}",
+                    channel.channel_id, channel.protocol
+                )));
+            }
+            if !channel_ids.insert(id.to_string()) {
+                return Err(StoreError::Validation(format!("duplicate channel id {id}")));
+            }
+            if channel.enabled && !enabled_ports.insert(port.to_ascii_lowercase()) {
+                return Err(StoreError::Validation(format!(
+                    "serial port {port} is assigned to more than one enabled channel"
+                )));
+            }
+            if channel.baud_rate == 0
+                || !(5..=8).contains(&channel.data_bits)
+                || !(1..=2).contains(&channel.stop_bits)
+                || !(100..=60_000).contains(&channel.timeout_ms)
+                || channel.retry_count > 10
+                || !(5..=86_400).contains(&channel.poll_interval_s)
+            {
+                return Err(StoreError::Validation(format!(
+                    "channel {} has invalid serial or retry settings",
+                    channel.channel_id
+                )));
+            }
+        }
+        for channel in channels {
+            let parity = normalize_parity(&channel.parity)?;
+            tx.execute(
+                "INSERT INTO rs485_channel(id,name,protocol,port,baud,data_bits,stop_bits,parity,timeout_ms,
+                    retry_count,poll_interval_s,config_source,enabled,updated_ms)
+                 VALUES(?1,?2,'MODBUS_RTU',?3,?4,?5,?6,?7,?8,?9,?10,'PLATFORM',?11,?12)
+                 ON CONFLICT(id) DO UPDATE SET name=excluded.name,protocol=excluded.protocol,port=excluded.port,
+                   baud=excluded.baud,data_bits=excluded.data_bits,stop_bits=excluded.stop_bits,
+                   parity=excluded.parity,timeout_ms=excluded.timeout_ms,retry_count=excluded.retry_count,
+                   poll_interval_s=excluded.poll_interval_s,config_source='PLATFORM',enabled=excluded.enabled,
+                   updated_ms=excluded.updated_ms",
+                params![channel.channel_id,channel.channel_name,channel.serial_port,channel.baud_rate,
+                    channel.data_bits,channel.stop_bits,parity,channel.timeout_ms,channel.retry_count,
+                    channel.poll_interval_s,channel.enabled as i64,now_ms as i64],
+            )?;
+        }
         for device in devices {
             let has_model = models.iter().any(|model| model.profile == device.profile)
                 || tx.query_row(
@@ -646,6 +739,19 @@ impl Store {
             for row in &model.points {
                 validate_register_row(row)?;
             }
+            for command in &model.commands {
+                if command.profile != model.profile
+                    || command.command_code.trim().is_empty()
+                    || command.function_code != 6
+                    || !command.encode_type.eq_ignore_ascii_case("FIXED")
+                    || command.fixed_value.is_none()
+                {
+                    return Err(StoreError::Validation(format!(
+                        "model {} contains an unsupported or incomplete protocol command",
+                        model.profile
+                    )));
+                }
+            }
         }
         for model in models {
             tx.execute(
@@ -659,11 +765,21 @@ impl Store {
                 "DELETE FROM meter_register_map WHERE profile=?1",
                 params![model.profile],
             )?;
+            tx.execute("DELETE FROM protocol_command WHERE profile=?1", params![model.profile])?;
             for row in &model.points {
                 tx.execute(
-                    "INSERT INTO meter_register_map(profile,point_code,point_name,unit,func,address,quantity,data_type,byte_order,scale,offset)
-                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-                    params![row.profile,row.point_code,row.point_name,row.unit,row.func,row.address,row.quantity,row.data_type,row.byte_order,row.scale,row.offset],
+                    "INSERT INTO meter_register_map(profile,point_code,point_name,unit,func,address,quantity,field_offset,field_quantity,bit_offset,bit_length,data_type,byte_order,scale,offset)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                    params![row.profile,row.point_code,row.point_name,row.unit,row.func,row.address,row.quantity,
+                        row.field_offset,row.field_quantity,row.bit_offset,row.bit_length,row.data_type,row.byte_order,row.scale,row.offset],
+                )?;
+            }
+            for command in &model.commands {
+                tx.execute(
+                    "INSERT INTO protocol_command(profile,command_code,command_name,function_code,register_address,encode_type,fixed_value,parameter_json)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![command.profile,command.command_code,command.command_name,command.function_code,
+                        command.register_address,command.encode_type,command.fixed_value,command.parameter_json],
                 )?;
             }
         }
@@ -674,22 +790,26 @@ impl Store {
             } else {
                 requested_channel.to_string()
             };
-            let channel_exists = channel_id == STAGING_CHANNEL_ID
-                || tx
-                    .query_row(
-                        "SELECT 1 FROM rs485_channel WHERE id=?1",
-                        params![channel_id],
-                        |_| Ok(()),
-                    )
-                    .optional()?
-                    .is_some();
-            let assigned_channel = if channel_exists {
-                channel_id
-            } else {
-                STAGING_CHANNEL_ID.to_string()
-            };
-            let can_enable =
-                channel_exists && assigned_channel != STAGING_CHANNEL_ID && device.enabled;
+            let channel_enabled = tx
+                .query_row(
+                    "SELECT enabled FROM rs485_channel WHERE id=?1",
+                    params![channel_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if channel_id == STAGING_CHANNEL_ID || channel_enabled.is_none() {
+                return Err(StoreError::Validation(format!(
+                    "device {} references missing channel {}",
+                    device.device_sn, channel_id
+                )));
+            }
+            if device.enabled && channel_enabled != Some(1) {
+                return Err(StoreError::Validation(format!(
+                    "device {} references disabled channel {}",
+                    device.device_sn, channel_id
+                )));
+            }
+            let can_enable = channel_enabled == Some(1) && device.enabled;
             tx.execute(
                 "INSERT INTO meter(device_sn,device_name,modbus_addr,profile,channel_id,config_source,
                    platform_device_id,model_version,upload_enabled,collect_interval_s,enabled,created_ms)
@@ -700,17 +820,50 @@ impl Store {
                    upload_enabled=?10,
                    collect_interval_s=excluded.collect_interval_s,
                    enabled=?10",
-                params![device.device_sn,device.device_name,device.modbus_addr,device.profile,assigned_channel,
+                params![device.device_sn,device.device_name,device.modbus_addr,device.profile,channel_id,
                     device.platform_device_id,device.model_version,device.collect_interval_s as i64,now_ms as i64,
                     can_enable as i64],
             )?;
         }
+        let desired_devices = devices
+            .iter()
+            .map(|device| device.device_sn.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let platform_devices = {
+            let mut stmt = tx.prepare("SELECT device_sn FROM meter WHERE config_source='PLATFORM'")?;
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for device_sn in platform_devices {
+            if !desired_devices.contains(device_sn.as_str()) {
+                tx.execute("DELETE FROM meter WHERE device_sn=?1", params![device_sn])?;
+            }
+        }
+        let platform_channels = {
+            let mut stmt = tx.prepare("SELECT id FROM rs485_channel WHERE config_source='PLATFORM'")?;
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for channel_id in platform_channels {
+            if !channel_ids.contains(&channel_id) {
+                tx.execute("DELETE FROM rs485_channel WHERE id=?1", params![channel_id])?;
+            }
+        }
         tx.execute(
-            "UPDATE config_sync_state SET desired_revision=?1,applied_revision=?1,last_sync_ms=?2,
-               last_status='APPLIED',last_error=NULL WHERE id=1",
+            "UPDATE config_sync_state SET desired_revision=?1,last_sync_ms=?2,
+               last_status='STAGED',last_error=NULL WHERE id=1",
             params![revision, now_ms as i64],
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    pub fn record_sync_applied(&self, revision: &str, now_ms: u64) -> StoreResult<()> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute(
+            "UPDATE config_sync_state SET applied_revision=?1,last_sync_ms=?2,last_status='APPLIED',last_error=NULL WHERE id=1",
+            params![revision, now_ms as i64],
+        )?;
         Ok(())
     }
 
@@ -974,8 +1127,8 @@ impl Store {
         )?;
         for row in rows {
             tx.execute(
-                "INSERT INTO meter_register_map(profile, point_code, point_name, unit, func, address, quantity, data_type, byte_order, scale, offset)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "INSERT INTO meter_register_map(profile, point_code, point_name, unit, func, address, quantity, field_offset, field_quantity, bit_offset, bit_length, data_type, byte_order, scale, offset)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     row.profile,
                     row.point_code,
@@ -984,6 +1137,10 @@ impl Store {
                     row.func,
                     row.address,
                     row.quantity,
+                    row.field_offset,
+                    row.field_quantity,
+                    row.bit_offset,
+                    row.bit_length,
                     row.data_type,
                     row.byte_order,
                     row.scale,
@@ -998,7 +1155,7 @@ impl Store {
     pub fn register_map(&self, profile: &str) -> StoreResult<Vec<RegisterMapRow>> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT profile, point_code, point_name, unit, func, address, quantity, data_type, byte_order, scale, offset
+            "SELECT profile, point_code, point_name, unit, func, address, quantity, field_offset, field_quantity, bit_offset, bit_length, data_type, byte_order, scale, offset
              FROM meter_register_map WHERE profile=?1 ORDER BY address",
         )?;
         let rows = stmt
@@ -1011,14 +1168,41 @@ impl Store {
                     func: r.get::<_, i64>(4)? as u8,
                     address: r.get::<_, i64>(5)? as u16,
                     quantity: r.get::<_, i64>(6)? as u16,
-                    data_type: r.get(7)?,
-                    byte_order: r.get(8)?,
-                    scale: r.get(9)?,
-                    offset: r.get(10)?,
+                    field_offset: r.get::<_, i64>(7)? as u16,
+                    field_quantity: r.get::<_, i64>(8)? as u16,
+                    bit_offset: r.get::<_, Option<i64>>(9)?.map(|v| v as u8),
+                    bit_length: r.get::<_, Option<i64>>(10)?.map(|v| v as u8),
+                    data_type: r.get(11)?,
+                    byte_order: r.get(12)?,
+                    scale: r.get(13)?,
+                    offset: r.get(14)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    pub fn protocol_command(
+        &self,
+        profile: &str,
+        command_code: &str,
+    ) -> StoreResult<Option<ProtocolCommandRow>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.query_row(
+            "SELECT profile,command_code,command_name,function_code,register_address,encode_type,fixed_value,parameter_json
+             FROM protocol_command WHERE profile=?1 AND command_code=?2",
+            params![profile, command_code],
+            |r| Ok(ProtocolCommandRow {
+                profile: r.get(0)?,
+                command_code: r.get(1)?,
+                command_name: r.get(2)?,
+                function_code: r.get::<_, i64>(3)? as u8,
+                register_address: r.get::<_, i64>(4)? as u16,
+                encode_type: r.get(5)?,
+                fixed_value: r.get::<_, Option<i64>>(6)?.map(|value| value as u16),
+                parameter_json: r.get(7)?,
+            }),
+        ).optional().map_err(StoreError::from)
     }
 
     // ---------- outbox ----------
@@ -1135,6 +1319,29 @@ impl Store {
                     payload: r.get(3)?,
                     created_ms: r.get::<_, i64>(4)? as u64,
                     attempts: r.get::<_, u32>(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn recent_outbox(&self, limit: u32) -> StoreResult<Vec<OutboxRecord>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, message_id, topic, payload, created_ms, status, attempts, last_error
+             FROM outbox_message ORDER BY created_ms DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], |r| {
+                Ok(OutboxRecord {
+                    id: r.get(0)?,
+                    message_id: r.get(1)?,
+                    topic: r.get(2)?,
+                    payload: r.get(3)?,
+                    created_ms: r.get::<_, i64>(4)? as u64,
+                    status: r.get(5)?,
+                    attempts: r.get::<_, u32>(6)?,
+                    last_error: r.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1441,6 +1648,15 @@ impl Store {
         Ok(())
     }
 
+    pub fn command_result(&self, command_id: &str) -> StoreResult<Option<(String, String)>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.query_row(
+            "SELECT result_status,message FROM command_log WHERE command_id=?1 AND result_status IS NOT NULL",
+            params![command_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        ).optional().map_err(StoreError::from)
+    }
+
     pub fn recent_commands(&self, limit: u32) -> StoreResult<Vec<CommandLogRow>> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = conn.prepare(
@@ -1514,7 +1730,7 @@ fn validate_register_row(row: &RegisterMapRow) -> StoreResult<()> {
     }
     let data_type = row.data_type.trim().to_ascii_lowercase();
     let expected_quantity = match data_type.as_str() {
-        "u16" | "i16" => 1,
+        "u16" | "uint16" | "i16" | "int16" | "boolean" => 1,
         "u32" | "i32" | "f32" | "float32" => 2,
         _ => {
             return Err(StoreError::Validation(format!(
@@ -1523,7 +1739,7 @@ fn validate_register_row(row: &RegisterMapRow) -> StoreResult<()> {
             )));
         }
     };
-    if row.quantity != expected_quantity {
+    if row.field_quantity != expected_quantity {
         return Err(StoreError::Validation(format!(
             "point {} quantity must be {} for {}",
             row.point_code, expected_quantity, row.data_type
@@ -1537,7 +1753,7 @@ fn validate_register_row(row: &RegisterMapRow) -> StoreResult<()> {
         )));
     }
     let order = row.byte_order.trim().to_ascii_uppercase();
-    let valid_order = match row.quantity {
+    let valid_order = match row.field_quantity {
         1 => matches!(order.as_str(), "" | "AB" | "BA" | "ABCD"),
         2 => matches!(order.as_str(), "" | "ABCD" | "BADC" | "CDAB" | "DCBA"),
         _ => false,
@@ -1545,10 +1761,19 @@ fn validate_register_row(row: &RegisterMapRow) -> StoreResult<()> {
     if !valid_order {
         return Err(StoreError::Validation(format!(
             "point {} byte_order {} does not match quantity {}",
-            row.point_code, row.byte_order, row.quantity
+            row.point_code, row.byte_order, row.field_quantity
         )));
     }
     Ok(())
+}
+
+fn normalize_parity(value: &str) -> StoreResult<String> {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "N" | "NONE" => Ok("NONE".to_string()),
+        "E" | "EVEN" => Ok("EVEN".to_string()),
+        "O" | "ODD" => Ok("ODD".to_string()),
+        other => Err(StoreError::Validation(format!("unsupported parity {other}"))),
+    }
 }
 
 #[cfg(test)]
@@ -1603,5 +1828,67 @@ mod tests {
         store
             .insert_meter(&meter("STAGED-2", STAGING_CHANNEL_ID, 1), 2)
             .expect("staging does not participate in bus address uniqueness");
+    }
+
+    fn synced_channel(id: &str, port: &str) -> SyncedChannel {
+        SyncedChannel {
+            channel_id: id.to_string(),
+            channel_name: id.to_string(),
+            protocol: "MODBUS_RTU".to_string(),
+            serial_port: port.to_string(),
+            baud_rate: 19_200,
+            data_bits: 8,
+            stop_bits: 1,
+            parity: "E".to_string(),
+            timeout_ms: 1_500,
+            retry_count: 3,
+            poll_interval_s: 30,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn platform_sync_persists_channel_runtime_settings() {
+        let store = test_store("platform-channel");
+        store
+            .apply_platform_sync("rev-1", &[synced_channel("rs485-9", "COM20")], &[], &[], 10)
+            .expect("platform channel should be staged");
+
+        let channel = store
+            .channels()
+            .expect("list channels")
+            .into_iter()
+            .find(|item| item.id == "rs485-9")
+            .expect("synced channel exists");
+        assert_eq!(channel.port, "COM20");
+        assert_eq!(channel.baud, 19_200);
+        assert_eq!(channel.parity, "EVEN");
+        assert_eq!(channel.timeout_ms, 1_500);
+        assert_eq!(channel.retry_count, 3);
+        assert_eq!(channel.poll_interval_s, 30);
+        assert_eq!(channel.config_source, "PLATFORM");
+    }
+
+    #[test]
+    fn platform_sync_rejects_unsupported_protocol_and_duplicate_port() {
+        let store = test_store("platform-channel-invalid");
+        let mut tcp = synced_channel("tcp-1", "127.0.0.1:502");
+        tcp.protocol = "MODBUS_TCP".to_string();
+        assert!(store.apply_platform_sync("rev-1", &[tcp], &[], &[], 10).is_err());
+
+        assert!(
+            store
+                .apply_platform_sync(
+                    "rev-2",
+                    &[
+                        synced_channel("rs485-1", "COM20"),
+                        synced_channel("rs485-2", "com20"),
+                    ],
+                    &[],
+                    &[],
+                    20,
+                )
+                .is_err()
+        );
     }
 }

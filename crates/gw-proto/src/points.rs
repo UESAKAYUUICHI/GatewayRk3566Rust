@@ -1,5 +1,5 @@
 //! 标准测点键与单位。
-//! 键名必须与平台 `dev_point_mapping.source_path`（`$.xxx`）保持一致，
+//! 键名必须与平台发布的产品测点编码保持一致，
 //! 云侧 JsonPointParser 依据映射表把原始键转为 VOLTAGE_A 等标准测点编码。
 
 pub const VOLTAGE_A: &str = "voltage_a";

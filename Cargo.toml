@@ -27,7 +27,7 @@ gw-agent = { path = "crates/gw-agent" }
 gw-network = { path = "crates/gw-network" }
 gw-web = { path = "crates/gw-web" }
 
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal", "process", "io-util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -35,7 +35,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 async-trait = "0.1"
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["io"] }
 slint = "1.13"
 slint-build = "1.13"
 toml = "0.8"

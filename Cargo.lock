@@ -2036,6 +2036,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-serial",
  "tokio-util",
  "tower-http",
  "tracing",

@@ -1,5 +1,5 @@
 //! 寄存器档案：把 Modbus 寄存器布局表达为数据（profiles/*.toml），
-//! 与平台侧 `dev_point_mapping` 的配置化思想镜像 —— 新表型零代码接入。
+//! 本地 TOML 档案仅用于离线调试；生产采集计划由平台协议版本下发。
 
 use std::collections::BTreeMap;
 

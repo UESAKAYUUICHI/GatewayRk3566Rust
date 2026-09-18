@@ -27,4 +27,17 @@ pub trait MeterTransport: Send {
         address: u16,
         quantity: u16,
     ) -> TransportResult<Vec<u16>>;
+
+    /// Write one holding register (function code 06).
+    async fn write_single_register(
+        &mut self,
+        slave: u8,
+        address: u16,
+        value: u16,
+    ) -> TransportResult<()> {
+        let _ = (slave, address, value);
+        Err(TransportError::Exception(
+            "write single register is not supported by this transport".into(),
+        ))
+    }
 }

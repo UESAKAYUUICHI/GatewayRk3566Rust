@@ -83,8 +83,7 @@ impl GatewayUploadPayload {
     }
 }
 
-/// 单表采样（对应云侧 MeterPayload）。points 键与平台 `dev_point_mapping.source_path`
-/// 的 JSON 路径一致（如 `$.voltage_a` → 键 `voltage_a`），云侧经 JsonPath 映射为标准测点。
+/// 单表采样（对应云侧 MeterPayload）。points 键为已发布的标准测点编码。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeterSample {
     #[serde(rename = "deviceSn")]
