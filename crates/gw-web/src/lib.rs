@@ -3111,7 +3111,7 @@ fn normalize_point_code(code: &str) -> String {
 fn quality_label(quality: u32) -> &'static str {
     match quality {
         0 => "有效",
-        1 => "可疑",
+        1 => "回退",
         2 => "缺失",
         3 => "异常",
         _ => "待确认",

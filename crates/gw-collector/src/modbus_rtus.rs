@@ -1,11 +1,15 @@
 //! Modbus RTU 真驱动（RS485 串口）。
+//!
+//! 使用严格的请求/响应整帧校验，不依赖会逐字节丢弃并重同步的通用
+//! decoder。串口线上出现残留字节、错位帧、非法功能码或 CRC 错误时，
+//! 整次采样失败，禁止把“恢复解码”的结果送入正式计量链路。
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use tokio_modbus::client::{Context, Reader, Writer, rtu};
-use tokio_modbus::prelude::Slave;
-use tokio_modbus::slave::SlaveContext;
-use tokio_serial::{DataBits, Parity, SerialPortBuilderExt, StopBits};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_serial::{
+    ClearBuffer, DataBits, Parity, SerialPort, SerialPortBuilderExt, SerialStream, StopBits,
+};
 
 use crate::transport::{MeterTransport, TransportError, TransportResult};
 
@@ -58,15 +62,14 @@ impl Default for SerialConfig {
     }
 }
 
-/// 持有一条串口连接的 RTU 主站。
+/// 持有一条串口连接的严格 RTU 主站。
 pub struct ModbusRtuTransport {
-    ctx: Context,
+    stream: SerialStream,
     timeout: std::time::Duration,
     retry_count: u32,
 }
 
 impl ModbusRtuTransport {
-    /// 打开串口并附加默认从站（每次读取前按表地址 set_slave）。
     pub async fn connect(serial: &SerialConfig) -> Result<Self, TransportError> {
         let data_bits = match serial.data_bits {
             5 => DataBits::Five,
@@ -90,12 +93,115 @@ impl ModbusRtuTransport {
         let stream = builder
             .open_native_async()
             .map_err(|e| TransportError::Io(format!("打开串口 {} 失败: {e}", serial.port)))?;
-        let ctx = rtu::attach_slave(stream, Slave(0));
         Ok(Self {
-            ctx,
+            stream,
             timeout: std::time::Duration::from_millis(serial.timeout_ms.max(100)),
             retry_count: serial.retry_count,
         })
+    }
+
+    fn clear_input(&self) -> TransportResult<()> {
+        self.stream
+            .clear(ClearBuffer::Input)
+            .map_err(|e| TransportError::Io(format!("清理串口输入缓冲失败: {e}")))
+    }
+
+    async fn read_exact_timeout(&mut self, bytes: &mut [u8]) -> TransportResult<()> {
+        tokio::time::timeout(self.timeout, self.stream.read_exact(bytes))
+            .await
+            .map_err(|_| TransportError::NoResponse)?
+            .map(|_| ())
+            .map_err(|e| TransportError::Io(format!("读取 RTU 响应失败: {e}")))
+    }
+
+    async fn transact(
+        &mut self,
+        request: &[u8],
+        slave: u8,
+        function_code: u8,
+        quantity: Option<u16>,
+        address: u16,
+    ) -> TransportResult<Vec<u8>> {
+        self.clear_input()?;
+        self.stream
+            .write_all(request)
+            .await
+            .map_err(|e| TransportError::Io(format!("发送 RTU 请求失败: {e}")))?;
+        self.stream
+            .flush()
+            .await
+            .map_err(|e| TransportError::Io(format!("刷新串口发送缓冲失败: {e}")))?;
+
+        let mut prefix = [0u8; 3];
+        self.read_exact_timeout(&mut prefix).await?;
+        if prefix[0] != slave {
+            return Err(TransportError::CorruptFrame(format!(
+                "从站号不匹配 @fc{function_code}/0x{address:04X}: expected {slave}, got {}",
+                prefix[0]
+            )));
+        }
+
+        let response_function = prefix[1];
+        if response_function == (function_code | 0x80) {
+            let mut crc = [0u8; 2];
+            self.read_exact_timeout(&mut crc).await?;
+            let mut frame = prefix.to_vec();
+            frame.extend_from_slice(&crc);
+            validate_crc(&frame)?;
+            return Err(TransportError::Exception(format!(
+                "fc{function_code}/slave{slave}/0x{address:04X}: exception code 0x{:02X}",
+                prefix[2]
+            )));
+        }
+        if response_function != function_code {
+            return Err(TransportError::CorruptFrame(format!(
+                "功能码不匹配 @slave{slave}/0x{address:04X}: expected 0x{function_code:02X}, got 0x{response_function:02X}"
+            )));
+        }
+
+        let byte_count = usize::from(prefix[2]);
+        if let Some(quantity) = quantity {
+            let expected = usize::from(quantity) * 2;
+            if byte_count != expected {
+                return Err(TransportError::CorruptFrame(format!(
+                    "字节数不匹配 @slave{slave}/0x{address:04X}: expected {expected}, got {byte_count}"
+                )));
+            }
+        }
+        let mut frame = prefix.to_vec();
+        let mut body_and_crc = vec![0u8; byte_count + 2];
+        self.read_exact_timeout(&mut body_and_crc).await?;
+        frame.extend_from_slice(&body_and_crc);
+        validate_crc(&frame)?;
+        Ok(frame)
+    }
+
+    async fn transact_write(
+        &mut self,
+        request: &[u8],
+        slave: u8,
+        address: u16,
+    ) -> TransportResult<Vec<u8>> {
+        self.clear_input()?;
+        self.stream
+            .write_all(request)
+            .await
+            .map_err(|e| TransportError::Io(format!("发送 RTU 写请求失败: {e}")))?;
+        self.stream
+            .flush()
+            .await
+            .map_err(|e| TransportError::Io(format!("刷新串口发送缓冲失败: {e}")))?;
+
+        let mut frame = [0u8; 8];
+        self.read_exact_timeout(&mut frame).await?;
+        if frame[0] != slave || frame[1] != 6 {
+            return Err(TransportError::CorruptFrame(format!(
+                "写入响应头不匹配 @slave{slave}/0x{address:04X}: {:02X?}",
+                &frame[..2]
+            )));
+        }
+        validate_crc(&frame)?;
+        Ok(frame.to_vec())
     }
 }
 
@@ -108,44 +214,43 @@ impl MeterTransport for ModbusRtuTransport {
         address: u16,
         quantity: u16,
     ) -> TransportResult<Vec<u16>> {
-        self.ctx.set_slave(Slave(slave));
-        // tokio-modbus 0.16 返回双层 Result：外层=传输错误，内层=Modbus 异常码
         if function_code != 3 && function_code != 4 {
             return Err(TransportError::Exception(format!(
                 "unsupported function code {function_code} @slave{slave}/0x{address:04X}"
             )));
         }
+        let mut request = vec![
+            slave,
+            function_code,
+            (address >> 8) as u8,
+            address as u8,
+            (quantity >> 8) as u8,
+            quantity as u8,
+        ];
+        append_crc(&mut request);
+
         let mut last_error = None;
         for attempt in 0..=self.retry_count {
-            self.ctx.set_slave(Slave(slave));
-            let response = tokio::time::timeout(self.timeout, async {
-                match function_code {
-                    3 => self.ctx.read_holding_registers(address, quantity).await,
-                    4 => self.ctx.read_input_registers(address, quantity).await,
-                    _ => unreachable!(),
-                }
-            })
-            .await;
-            match response {
-                Ok(Ok(Ok(words))) if words.len() == quantity as usize => return Ok(words),
-                Ok(Ok(Ok(words))) => {
+            match self
+                .transact(&request, slave, function_code, Some(quantity), address)
+                .await
+            {
+                Ok(frame) => {
+                    let words = frame[3..frame.len() - 2]
+                        .chunks_exact(2)
+                        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                        .collect::<Vec<_>>();
+                    if words.len() == usize::from(quantity) {
+                        return Ok(words);
+                    }
                     last_error = Some(TransportError::BadLength {
                         want: quantity,
                         got: words.len(),
                     });
                 }
-                Ok(Ok(Err(exception))) => {
-                    return Err(TransportError::Exception(format!(
-                        "fc{function_code}/slave{slave}/0x{address:04X}: {exception:?}"
-                    )));
-                }
-                Ok(Err(error)) => {
-                    last_error = Some(TransportError::Io(format!(
-                        "modbus 传输错误 @fc{function_code}/slave{slave}/0x{address:04X}: {error}"
-                    )));
-                }
-                Err(_) => last_error = Some(TransportError::NoResponse),
+                Err(error) => last_error = Some(error),
             }
+            let _ = self.clear_input();
             if attempt < self.retry_count {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
@@ -159,27 +264,67 @@ impl MeterTransport for ModbusRtuTransport {
         address: u16,
         value: u16,
     ) -> TransportResult<()> {
-        self.ctx.set_slave(Slave(slave));
+        let mut request = vec![
+            slave,
+            6,
+            (address >> 8) as u8,
+            address as u8,
+            (value >> 8) as u8,
+            value as u8,
+        ];
+        append_crc(&mut request);
+
         let mut last_error = None;
         for attempt in 0..=self.retry_count {
-            self.ctx.set_slave(Slave(slave));
-            match tokio::time::timeout(
-                self.timeout,
-                self.ctx.write_single_register(address, value),
-            ).await {
-                Ok(Ok(Ok(()))) => return Ok(()),
-                Ok(Ok(Err(exception))) => return Err(TransportError::Exception(format!(
-                    "fc6/slave{slave}/0x{address:04X}: {exception:?}"
-                ))),
-                Ok(Err(error)) => last_error = Some(TransportError::Io(format!(
-                    "modbus write error @fc6/slave{slave}/0x{address:04X}: {error}"
-                ))),
-                Err(_) => last_error = Some(TransportError::NoResponse),
+            match self.transact_write(&request, slave, address).await {
+                Ok(frame) if frame == request => return Ok(()),
+                Ok(frame) => {
+                    last_error = Some(TransportError::CorruptFrame(format!(
+                        "写入回显不匹配 @slave{slave}/0x{address:04X}: {frame:02X?}"
+                    )));
+                }
+                Err(error) => last_error = Some(error),
             }
+            let _ = self.clear_input();
             if attempt < self.retry_count {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
         Err(last_error.unwrap_or(TransportError::NoResponse))
     }
+}
+
+fn append_crc(frame: &mut Vec<u8>) {
+    let crc = crc16(frame);
+    frame.push((crc & 0xFF) as u8);
+    frame.push((crc >> 8) as u8);
+}
+
+fn validate_crc(frame: &[u8]) -> TransportResult<()> {
+    if frame.len() < 4 {
+        return Err(TransportError::CorruptFrame("RTU 帧长度不足".into()));
+    }
+    let expected = u16::from_le_bytes([frame[frame.len() - 2], frame[frame.len() - 1]]);
+    let actual = crc16(&frame[..frame.len() - 2]);
+    if expected != actual {
+        return Err(TransportError::CorruptFrame(format!(
+            "CRC 校验失败: expected 0x{expected:04X}, actual 0x{actual:04X}"
+        )));
+    }
+    Ok(())
+}
+
+fn crc16(bytes: &[u8]) -> u16 {
+    let mut crc = 0xFFFF;
+    for byte in bytes {
+        crc ^= u16::from(*byte);
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xA001;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    crc
 }

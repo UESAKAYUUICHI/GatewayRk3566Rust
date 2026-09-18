@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gw_collector::{MeterTransport, ModbusRtuTransport, SerialConfig};
 use gw_collector::profile::{DataType, MeterProfile, RegisterSpec};
+use gw_collector::{MeterTransport, ModbusRtuTransport, SerialConfig};
 use gw_core::clock::{ClockAssessor, ClockTrust};
 use gw_core::command::{self, GatewayAction};
 use gw_core::energy::{self, EnergyVerdict};
@@ -385,7 +385,10 @@ fn seed_meters(store: &Store, bootstrap: &BootstrapConfig, now_ms: u64) {
 /// 档案行 → 解码规格。
 fn specs_of(rows: &[gw_store::RegisterMapRow]) -> Vec<gw_store::RegisterMapRow> {
     rows.iter()
-        .filter(|row| row.data_type.eq_ignore_ascii_case("boolean") || DataType::parse(&row.data_type).is_some())
+        .filter(|row| {
+            row.data_type.eq_ignore_ascii_case("boolean")
+                || DataType::parse(&row.data_type).is_some()
+        })
         .cloned()
         .collect()
 }
@@ -401,26 +404,43 @@ async fn poll_once<T: MeterTransport + ?Sized>(
     for spec in specs {
         let key = (spec.func, spec.address, spec.quantity);
         if let std::collections::hash_map::Entry::Vacant(entry) = words.entry(key) {
-            let got = guard.read_registers(spec.func, meter.modbus_addr, spec.address, spec.quantity).await?;
+            let got = guard
+                .read_registers(spec.func, meter.modbus_addr, spec.address, spec.quantity)
+                .await?;
             entry.insert(got);
         }
     }
     let mut points: Vec<(String, f64)> = Vec::with_capacity(specs.len());
     for spec in specs {
-        let Some(block) = words.get(&(spec.func, spec.address, spec.quantity)) else { continue };
+        let Some(block) = words.get(&(spec.func, spec.address, spec.quantity)) else {
+            continue;
+        };
         let start = spec.field_offset as usize;
         let end = start + spec.field_quantity as usize;
-        if end > block.len() { continue; }
+        if end > block.len() {
+            continue;
+        }
         let value = if let Some(bit_offset) = spec.bit_offset {
             let width = spec.bit_length.unwrap_or(1).min(16);
-            let mask = if width == 16 { u16::MAX } else { (1u16 << width) - 1 };
+            let mask = if width == 16 {
+                u16::MAX
+            } else {
+                (1u16 << width) - 1
+            };
             ((block[start] >> bit_offset) & mask) as f64 * spec.scale + spec.offset
         } else {
-            let Some(data_type) = DataType::parse(&spec.data_type) else { continue };
+            let Some(data_type) = DataType::parse(&spec.data_type) else {
+                continue;
+            };
             let field = RegisterSpec {
-                point: spec.point_code.clone(), func: spec.func, address: 0,
-                quantity: spec.field_quantity, data_type, byte_order: spec.byte_order.clone(),
-                scale: spec.scale, offset: spec.offset,
+                point: spec.point_code.clone(),
+                func: spec.func,
+                address: 0,
+                quantity: spec.field_quantity,
+                data_type,
+                byte_order: spec.byte_order.clone(),
+                scale: spec.scale,
+                offset: spec.offset,
             };
             MeterProfile::decode_one(&field, &block[start..end])
         };
@@ -596,43 +616,107 @@ async fn handle_sample(ctx: &TaskCtx, meter: &MeterRuntime, points: Vec<(String,
     let total = points
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(FORWARD_ACTIVE_ENERGY))
-        .map(|(_, v)| *v);
+        .map(|(_, v)| *v)
+        .filter(|v| v.is_finite());
 
-    let verdict = energy::evaluate(meter.last_total_kwh, total.unwrap_or(f64::NAN));
-    let reportable = match verdict {
-        EnergyVerdict::Rollback { previous, current } => {
-            ctx.emitter.emit(
-                "WARN",
-                "energy",
-                format!(
-                    "{} 读数回退 {previous:.2} → {current:.2} kWh（表清零/换表），样本不上报并重建基线",
-                    meter.record.device_sn
-                ),
-            );
-            false
-        }
-        EnergyVerdict::Delta(delta) => {
-            if delta > 0.0 {
-                let day = energy::day_key(now, ctx.tz_offset_s);
-                if let Err(e) = ctx.store.add_energy(meter.record.id, &day, delta) {
-                    tracing::warn!("电能日账写入失败: {e}");
-                }
+    let mut quality = proto::model::QUALITY_NORMAL;
+    let mut rollback_active = meter.rollback_active;
+    let mut stable_readings = meter.rollback_stable_readings;
+    let mut rollback_warning = None;
+    let mut recovered = false;
+
+    if let Some(current) = total {
+        if rollback_active {
+            // 回退期只接受连续不下降的读数作为恢复候选；任何再次下降都会
+            // 清零计数，但仍保留当前值作为下一次判断的现场基线。
+            if meter
+                .last_total_kwh
+                .map(|previous| current + energy::MONOTONIC_EPSILON >= previous)
+                .unwrap_or(false)
+            {
+                stable_readings = stable_readings.saturating_add(1);
+            } else {
+                stable_readings = 0;
             }
-            true
+            quality = proto::model::QUALITY_ROLLBACK;
+            if stable_readings >= energy::ROLLBACK_RECOVERY_STABLE_READINGS {
+                rollback_active = false;
+                stable_readings = 0;
+                recovered = true;
+            }
+        } else {
+            match energy::evaluate(meter.last_total_kwh, current) {
+                EnergyVerdict::Rollback { previous, current } => {
+                    rollback_active = true;
+                    stable_readings = 0;
+                    quality = proto::model::QUALITY_ROLLBACK;
+                    rollback_warning = Some((previous, current));
+                }
+                EnergyVerdict::Delta(delta) if delta > 0.0 => {
+                    let day = energy::day_key(now, ctx.tz_offset_s);
+                    if let Err(e) = ctx.store.add_energy(meter.record.id, &day, delta) {
+                        tracing::warn!("电能日账写入失败: {e}");
+                    }
+                }
+                EnergyVerdict::Delta(_) | EnergyVerdict::First => {}
+            }
         }
-        EnergyVerdict::First => true,
-    };
-    // NaN（本次无电能点位）按可上报处理，不参与能量账
-    let reportable = reportable || total.is_none();
+    }
+
+    // 回退样本照常保存、上报并保留质量标记，但永远不执行能耗增量。
+    // 进入回退状态时立即提示，持续回退最多每分钟提示一次。
+    if quality == proto::model::QUALITY_ROLLBACK {
+        let should_warn = rollback_warning.is_some()
+            || now.saturating_sub(meter.last_rollback_warn_ms) >= energy::ROLLBACK_WARN_INTERVAL_MS;
+        if should_warn {
+            if let Some((previous, current)) = rollback_warning {
+                rollback_warning = Some((previous, current));
+            } else {
+                rollback_warning = Some((
+                    meter.last_total_kwh.unwrap_or_default(),
+                    total.unwrap_or_default(),
+                ));
+            }
+        } else {
+            rollback_warning = None;
+        }
+    }
+    let rollback_warn_emitted = rollback_warning.is_some();
+    if let Some((previous, current)) = rollback_warning {
+        ctx.emitter.emit(
+            "WARN",
+            "energy",
+            format!(
+                "{} 读数回退 {previous:.2} → {current:.2} kWh，样本保留为 QUALITY_ROLLBACK，不计入能耗增量",
+                meter.record.device_sn
+            ),
+        );
+    }
+    if recovered {
+        ctx.emitter.emit(
+            "INFO",
+            "energy",
+            format!(
+                "{} 已连续 {} 次稳定读取，已重建能耗基线；下一次正常读数开始计量",
+                meter.record.device_sn,
+                energy::ROLLBACK_RECOVERY_STABLE_READINGS
+            ),
+        );
+    }
 
     ctx.state.update_meter(meter.record.id, |m| {
         m.online = true;
         m.consecutive_failures = 0;
         m.last_read_ms = now;
-        m.last_quality = proto::model::QUALITY_NORMAL;
+        m.last_quality = quality;
         m.last_points = points.clone();
         if let Some(t) = total {
             m.last_total_kwh = Some(t);
+        }
+        m.rollback_active = rollback_active;
+        m.rollback_stable_readings = stable_readings;
+        if quality == proto::model::QUALITY_ROLLBACK && rollback_warn_emitted {
+            m.last_rollback_warn_ms = now;
         }
     });
     let reading = gw_store::ReadingRecord {
@@ -644,14 +728,9 @@ async fn handle_sample(ctx: &TaskCtx, meter: &MeterRuntime, points: Vec<(String,
         } else {
             meter.record.collect_interval_s
         },
-        quality: proto::model::QUALITY_NORMAL,
+        quality,
     };
-    let result = if reportable {
-        ctx.store.save_sample(&reading, now).map(|_| ())
-    } else {
-        // 回退样本保留为最新现场读数，但不进入可上报历史。
-        ctx.store.save_reading(&reading, now)
-    };
+    let result = ctx.store.save_sample(&reading, now).map(|_| ());
     if let Err(e) = result {
         tracing::warn!("读数落库失败: {e}");
     }
@@ -1141,22 +1220,33 @@ async fn handle_raw_command(ctx: &TaskCtx, reboot: &Arc<dyn RebootHook>, raw: Ra
             });
             response
         }
-        GatewayAction::DeviceCommand { target_sn, command_code } => {
+        GatewayAction::DeviceCommand {
+            target_sn,
+            command_code,
+        } => {
             if command_code.is_empty() {
                 proto::CommandResponse::failed(&body.command_id, "commandCode 不能为空", now)
             } else if let Some(meter) = ctx.state.meter_by_sn(target_sn) {
-                match ctx.store.protocol_command(&meter.record.profile, command_code) {
-                    Ok(Some(command)) if command.function_code == 6
-                        && command.encode_type.eq_ignore_ascii_case("FIXED")
-                        && command.fixed_value.is_some() => {
+                match ctx
+                    .store
+                    .protocol_command(&meter.record.profile, command_code)
+                {
+                    Ok(Some(command))
+                        if command.function_code == 6
+                            && command.encode_type.eq_ignore_ascii_case("FIXED")
+                            && command.fixed_value.is_some() =>
+                    {
                         match ctx.transports.get(&meter.record.channel_id) {
                             Some(transport) => {
                                 let mut guard = transport.lock().await;
-                                match guard.write_single_register(
-                                    meter.record.modbus_addr,
-                                    command.register_address,
-                                    command.fixed_value.unwrap_or_default(),
-                                ).await {
+                                match guard
+                                    .write_single_register(
+                                        meter.record.modbus_addr,
+                                        command.register_address,
+                                        command.fixed_value.unwrap_or_default(),
+                                    )
+                                    .await
+                                {
                                     Ok(()) => proto::CommandResponse::success(
                                         &body.command_id,
                                         format!("已执行 {}", command.command_name),
@@ -1579,7 +1669,13 @@ mod tests {
 
     #[async_trait]
     impl MeterTransport for BlockTransport {
-        async fn read_registers(&mut self, _: u8, _: u8, _: u16, _: u16) -> Result<Vec<u16>, gw_collector::TransportError> {
+        async fn read_registers(
+            &mut self,
+            _: u8,
+            _: u8,
+            _: u16,
+            _: u16,
+        ) -> Result<Vec<u16>, gw_collector::TransportError> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(vec![0x8001])
         }
@@ -1587,10 +1683,21 @@ mod tests {
 
     fn bit_row(code: &str, bit: u8) -> gw_store::RegisterMapRow {
         gw_store::RegisterMapRow {
-            profile: "LIGHTING".into(), point_code: code.into(), point_name: code.into(), unit: String::new(),
-            func: 3, address: 0x007A, quantity: 1, field_offset: 0, field_quantity: 1,
-            bit_offset: Some(bit), bit_length: Some(1), data_type: "boolean".into(), byte_order: "AB".into(),
-            scale: 1.0, offset: 0.0,
+            profile: "LIGHTING".into(),
+            point_code: code.into(),
+            point_name: code.into(),
+            unit: String::new(),
+            func: 3,
+            address: 0x007A,
+            quantity: 1,
+            field_offset: 0,
+            field_quantity: 1,
+            bit_offset: Some(bit),
+            bit_length: Some(1),
+            data_type: "boolean".into(),
+            byte_order: "AB".into(),
+            scale: 1.0,
+            offset: 0.0,
         }
     }
 
@@ -1599,14 +1706,34 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let transport = Mutex::new(BlockTransport(calls.clone()));
         let meter = MeterRecord {
-            id: 1, device_sn: "LIGHT-001".into(), device_name: "light".into(), modbus_addr: 7,
-            profile: "LIGHTING".into(), channel_id: "rs485-1".into(), config_source: "PLATFORM".into(),
-            platform_device_id: Some(1), model_version: "V1".into(), upload_enabled: true,
-            collect_interval_s: 60, enabled: true, created_ms: 0,
+            id: 1,
+            device_sn: "LIGHT-001".into(),
+            device_name: "light".into(),
+            modbus_addr: 7,
+            profile: "LIGHTING".into(),
+            channel_id: "rs485-1".into(),
+            config_source: "PLATFORM".into(),
+            platform_device_id: Some(1),
+            model_version: "V1".into(),
+            upload_enabled: true,
+            collect_interval_s: 60,
+            enabled: true,
+            created_ms: 0,
         };
-        let points = poll_once(&transport, &meter, &[bit_row("LOOP_1_STATUS", 15), bit_row("LOOP_16_STATUS", 0)])
-            .await.expect("block should decode");
+        let points = poll_once(
+            &transport,
+            &meter,
+            &[bit_row("LOOP_1_STATUS", 15), bit_row("LOOP_16_STATUS", 0)],
+        )
+        .await
+        .expect("block should decode");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(points, vec![("LOOP_1_STATUS".into(), 1.0), ("LOOP_16_STATUS".into(), 1.0)]);
+        assert_eq!(
+            points,
+            vec![
+                ("LOOP_1_STATUS".into(), 1.0),
+                ("LOOP_16_STATUS".into(), 1.0)
+            ]
+        );
     }
 }

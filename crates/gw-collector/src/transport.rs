@@ -10,6 +10,8 @@ pub enum TransportError {
     Exception(String),
     #[error("响应长度非法: 需要 {want} 字, 实得 {got} 字")]
     BadLength { want: u16, got: usize },
+    #[error("Modbus RTU 帧已拒绝: {0}")]
+    CorruptFrame(String),
     #[error("设备无响应（可能掉线）")]
     NoResponse,
 }

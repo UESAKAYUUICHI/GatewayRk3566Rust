@@ -724,12 +724,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "byteorder"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
-
-[[package]]
 name = "byteorder-lite"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1945,7 +1939,6 @@ dependencies = [
  "serde",
  "thiserror 2.0.20",
  "tokio",
- "tokio-modbus",
  "tokio-serial",
  "toml 0.8.23",
 ]
@@ -5872,24 +5865,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-modbus"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdd5def942f13ebaebe636834026213ad9501e1cbd77687545cc08af4febd8a8"
-dependencies = [
- "async-trait",
- "byteorder",
- "bytes",
- "futures-core",
- "futures-util",
- "log",
- "smallvec",
- "thiserror 2.0.20",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
 name = "tokio-rustls"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5946,7 +5921,6 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
- "libc",
  "pin-project-lite",
  "tokio",
 ]

@@ -4,7 +4,11 @@
 //! 因此网关必须保证上报读数单调；表清零/换表会触发回退，该样本要拦下并留痕。
 
 /// 读数回退比较容差（kWh），吸收浮点噪声。
-const MONOTONIC_EPSILON: f64 = 1e-6;
+pub const MONOTONIC_EPSILON: f64 = 1e-6;
+/// 连续稳定读取多少次后，才允许回退表重新进入正常计量。
+pub const ROLLBACK_RECOVERY_STABLE_READINGS: u32 = 3;
+/// 回退状态的重复告警最小间隔。
+pub const ROLLBACK_WARN_INTERVAL_MS: u64 = 60_000;
 
 /// 对一次新读数的判定结果。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -13,7 +17,7 @@ pub enum EnergyVerdict {
     First,
     /// 正常增量（可为 0，表示无用电）
     Delta(f64),
-    /// 读数回退：表清零/换表，样本不应上报，需重新建立基线
+    /// 读数回退：表清零/换表，样本保留但不产生能耗增量
     Rollback { previous: f64, current: f64 },
 }
 

@@ -9,6 +9,11 @@ pub const TYPE_HEARTBEAT: &str = "HEARTBEAT";
 pub const TYPE_ALARM_UPLOAD: &str = "ALARM_UPLOAD";
 pub const HEARTBEAT_STATUS_ONLINE: &str = "online";
 pub const QUALITY_NORMAL: u32 = 0;
+/// 累积量发生回退时保留的原始样本质量。
+///
+/// 保持为 1 是为了兼容已有的“非零质量为告警”展示逻辑，同时由云侧
+/// 将它区分为可追溯但不参与计量统计的回退样本。
+pub const QUALITY_ROLLBACK: u32 = 1;
 pub const COMMAND_STATUS_SUCCESS: &str = "SUCCESS";
 pub const COMMAND_STATUS_FAILED: &str = "FAILED";
 

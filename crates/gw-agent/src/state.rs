@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use gw_proto::model::QUALITY_ROLLBACK;
 use gw_proto::points::FORWARD_ACTIVE_ENERGY;
 use gw_store::MeterRecord;
 
@@ -18,6 +19,12 @@ pub struct MeterRuntime {
     pub last_points: Vec<(String, f64)>,
     /// 上一次正向有功总电能（kWh），能量单调基线
     pub last_total_kwh: Option<f64>,
+    /// 当前是否处于回退去抖期。
+    pub rollback_active: bool,
+    /// 回退后连续稳定读数次数。
+    pub rollback_stable_readings: u32,
+    /// 最近一次回退告警时间，用于抑制重复 WARN。
+    pub last_rollback_warn_ms: u64,
 }
 
 impl MeterRuntime {
@@ -44,7 +51,9 @@ impl MeterRuntime {
         let last_total_kwh = last_points
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(FORWARD_ACTIVE_ENERGY))
-            .map(|(_, v)| *v);
+            .map(|(_, v)| *v)
+            .filter(|v| v.is_finite());
+        let rollback_active = last_quality == QUALITY_ROLLBACK;
         Self {
             record,
             online: false,
@@ -53,6 +62,9 @@ impl MeterRuntime {
             last_quality,
             last_points,
             last_total_kwh,
+            rollback_active,
+            rollback_stable_readings: 0,
+            last_rollback_warn_ms: 0,
         }
     }
 }
