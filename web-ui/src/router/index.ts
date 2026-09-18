@@ -11,6 +11,7 @@ export default createRouter({history:createWebHashHistory(),routes:[
     {path:'heatmap',component:()=>import('../views/overview/energy/AnomalyHeatmap.vue')},
   ]},
   {path:'/overview/alarms',component:()=>import('../views/overview/AlarmCenter.vue')},
+  {path:'/overview/camera',component:()=>import('../views/overview/CameraTest.vue')},
   {path:'/collection/devices',component:()=>import('../views/collection/DeviceMonitor.vue')},
   {path:'/collection/history',component:()=>import('../views/collection/CollectHistory.vue')},
   {path:'/collection/channels',component:()=>import('../views/collection/ChannelManager.vue'),children:[

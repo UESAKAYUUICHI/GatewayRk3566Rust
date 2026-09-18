@@ -143,6 +143,23 @@ function valueText(value: number | null | undefined, unit = '') {
   return `${Number(value).toFixed(2)}${unit ? ` ${unit}` : ''}`
 }
 
+function qualityText(quality: number) {
+  if (quality === 0) return '有效'
+  if (quality === 1) return '可疑'
+  if (quality === 2) return '缺失'
+  if (quality === 3) return '异常'
+  return '待确认'
+}
+
+function formatCollectTime(value: number | string | null | undefined) {
+  const timestamp = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return '未采集'
+  const date = new Date(timestamp)
+  if (Number.isNaN(date.getTime())) return '未采集'
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
 function shortDeviceName(name: string) {
   const compact = name.replace(/\s+/g, '')
   return compact || '现场设备'
@@ -359,7 +376,7 @@ onBeforeUnmount(() => { detailResizeObserver?.disconnect(); detailChart?.dispose
                 <small>{{point.code}}</small>
                 <strong>{{point.name || point.code}}</strong>
                 <b>{{valueText(point.value, point.unit)}}</b>
-                <span>质量 {{point.quality}}% · {{point.collectTime || '未采集'}}</span>
+                <span>{{qualityText(point.quality)}} · {{formatCollectTime(point.collectTime)}}</span>
               </article>
               <div v-if="!selectedMeter.points.length" class="empty-row">暂无实时测点。</div>
             </section>

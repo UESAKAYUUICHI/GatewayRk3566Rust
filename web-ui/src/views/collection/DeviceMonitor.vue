@@ -68,7 +68,12 @@ onMounted(loadMeta)
         <span class="icon-btn danger" title="删除设备" @click.stop="askDelete(m.id)"><Trash2/></span>
       </button>
       <template v-for="group in grouped" :key="group.channel.id">
-        <div class="channel-label"><strong>{{group.channel.name}}</strong><span>{{group.channel.port}} · {{group.meters.length?`${group.meters.length} 台设备 · 地址 ${group.meters.map(m=>m.address).join('/')}`:'空闲总线'}}</span><button class="icon-btn bind" title="绑定暂存设备" @click="askBind(group.channel.id)"><Link2/></button></div>
+        <div class="channel-label">
+          <strong>{{group.channel.name}}</strong>
+          <span class="channel-port">{{group.channel.port}}</span>
+          <span class="channel-meter-count">{{group.meters.length?`${group.meters.length} 台设备 · 地址 ${group.meters.map(m=>m.address).join('/')}`:'空闲总线'}}</span>
+          <button class="icon-btn bind" title="绑定暂存设备" @click="askBind(group.channel.id)"><Link2/></button>
+        </div>
         <div v-if="!group.meters.length" class="empty-slot">未绑定设备</div>
         <button v-for="m in group.meters" :key="m.id" class="device-item" :class="{active:meter?.id===m.id}" @click="selected=m.id">
           <div><strong>{{m.sn}}</strong><StatusBadge :ok="m.online" :text="m.online?'在线':'离线'"/></div>

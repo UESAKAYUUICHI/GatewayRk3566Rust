@@ -1,4 +1,4 @@
-import { Activity, BellRing, Boxes, Cable, ChartSpline, CloudUpload, Cpu, DatabaseZap, FileClock, Gauge, ListChecks, Network, Radio, Settings2, ShieldAlert, type LucideIcon } from 'lucide-vue-next'
+import { Activity, BellRing, Boxes, Cable, Camera, ChartSpline, CloudUpload, Cpu, DatabaseZap, FileClock, Gauge, ListChecks, Network, Radio, Settings2, ShieldAlert, type LucideIcon } from 'lucide-vue-next'
 
 export interface NavItem{label:string;hint:string;path:string;icon:LucideIcon}
 export interface NavGroup{label:string;code:string;path:string;icon:LucideIcon;children:NavItem[]}
@@ -7,6 +7,7 @@ export const navigation:NavGroup[]=[
     {label:'网关概览',hint:'实时状态与快捷运维',path:'/overview/dashboard',icon:Activity},
     {label:'能源可视',hint:'趋势、负荷与异常分析',path:'/overview/energy',icon:ChartSpline},
     {label:'告警中心',hint:'当前异常与历史告警',path:'/overview/alarms',icon:BellRing},
+    {label:'摄像头测试',hint:'本地摄像头实时画面',path:'/overview/camera',icon:Camera},
   ]},
   {label:'设备采集',code:'COLLECTION',path:'/collection',icon:Radio,children:[
     {label:'设备监控',hint:'RS485 设备与实时测点',path:'/collection/devices',icon:Cpu},
