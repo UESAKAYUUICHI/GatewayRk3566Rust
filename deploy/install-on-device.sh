@@ -18,8 +18,8 @@ else
         cp -a ../web-ui/dist/. /usr/share/park-gateway/web-ui/
     fi
     getent group netdev >/dev/null 2>&1 || groupadd -r netdev
-    id parkgw >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin -G dialout,netdev parkgw
-    usermod -aG dialout,netdev parkgw
+    id parkgw >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin -G dialout,netdev,video parkgw
+    usermod -aG dialout,netdev,video parkgw
     chown -R parkgw:dialout /var/lib/park-gateway
     install -m 0644 park-gateway.service /etc/systemd/system/
     install -m 0644 60-park-gateway-serial.rules /etc/udev/rules.d/

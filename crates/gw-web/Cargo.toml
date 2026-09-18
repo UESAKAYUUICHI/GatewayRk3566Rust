@@ -30,3 +30,4 @@ tower-http = { workspace = true }
 futures-util = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
+tokio-serial = { workspace = true }

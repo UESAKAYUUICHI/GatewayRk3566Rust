@@ -1,13 +1,14 @@
 use std::{
     collections::BTreeMap,
     fs,
-    path::PathBuf,
-    process::Command,
-    sync::Arc,
+    path::{Path as FsPath, PathBuf},
+    process::{Command, Stdio},
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
 use axum::{
+    body::{Body, Bytes},
     Json, Router,
     extract::{
         Path, Query, State, WebSocketUpgrade,
@@ -18,11 +19,13 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use chrono::{DateTime, Local};
+use futures_util::stream;
 use gw_agent::{BootstrapConfig, TransportRegistry, UserCommand};
 use gw_core::snapshot::{LinkHealth, MeterSnapshot, Snapshot};
 use gw_network::{NetworkManager, NetworkSnapshot, WifiNetwork};
 use gw_store::{AlarmRuleRecord, MeterInput, MeterRecord, Store};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use tokio::process::Command as TokioCommand;
 use tokio::sync::{mpsc, watch};
 use tower_http::{
     services::{ServeDir, ServeFile},
@@ -50,6 +53,8 @@ pub struct NetworkCache {
 
 const NETWORK_CACHE_TTL: Duration = Duration::from_secs(8);
 const WEBSOCKET_SLOW_REFRESH: Duration = Duration::from_secs(8);
+static CAMERA_CAPTURE_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -156,6 +161,23 @@ struct SystemEnvironmentDto {
 struct SystemInfoItemDto {
     key: String,
     value: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CameraDeviceDto {
+    path: String,
+    name: String,
+    primary: bool,
+    stream_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CameraStreamQuery {
+    device: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    fps: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -475,8 +497,27 @@ struct SyncPayload {
     desired_revision: String,
     #[serde(default)]
     config_checksum: Option<String>,
+    channels: Vec<SyncChannelDto>,
     devices: Vec<SyncDeviceDto>,
     models: Vec<SyncModelDto>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncChannelDto {
+    channel_id: String,
+    channel_name: String,
+    protocol: String,
+    serial_port: String,
+    baud_rate: u32,
+    data_bits: u8,
+    stop_bits: u8,
+    parity: String,
+    timeout_ms: u64,
+    retry_count: u32,
+    poll_interval_seconds: u64,
+    #[serde(deserialize_with = "boolish")]
+    enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -488,9 +529,29 @@ struct SyncDeviceDto {
     modbus_addr: u8,
     channel_id: String,
     collect_interval_s: u64,
+    #[serde(deserialize_with = "boolish")]
     enabled: bool,
     model_version: String,
     profile_key: String,
+}
+
+fn boolish<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Bool(value) => Ok(value),
+        serde_json::Value::Number(value) => Ok(value.as_i64().unwrap_or(0) != 0),
+        serde_json::Value::String(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            Ok(matches!(value.as_str(), "1" | "true" | "yes" | "y" | "on" | "enabled"))
+        }
+        serde_json::Value::Null => Ok(false),
+        other => Err(serde::de::Error::custom(format!(
+            "expected bool/number/string, got {other}"
+        ))),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -500,24 +561,58 @@ struct SyncModelDto {
     profile_key: String,
     model_name: String,
     version: String,
-    points: Vec<SyncPointDto>,
+    read_blocks: Vec<SyncReadBlockDto>,
+    fields: Vec<SyncFieldDto>,
+    bindings: Vec<SyncBindingDto>,
+    #[serde(default)]
+    commands: Vec<SyncCommandDto>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SyncPointDto {
-    point_code: String,
-    point_name: String,
-    #[serde(default)]
-    unit: String,
+struct SyncReadBlockDto {
+    id: i64,
     function_code: u8,
-    register_address: u16,
+    start_address: u16,
+    register_count: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncFieldDto {
+    id: i64,
+    read_block_id: i64,
+    field_name: String,
+    register_offset: u16,
     register_length: u16,
     value_type: String,
     #[serde(default = "default_byte_order")]
     byte_order: String,
-    scale_factor: f64,
-    offset_value: f64,
+    bit_offset: Option<u8>,
+    bit_length: Option<u8>,
+    decode_factor: f64,
+    decode_offset: f64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncBindingDto {
+    point_code: String,
+    protocol_field_id: i64,
+    canonical_factor: f64,
+    canonical_offset: f64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncCommandDto {
+    command_code: String,
+    command_name: String,
+    function_code: u8,
+    register_address: u16,
+    encode_type: String,
+    fixed_value: Option<u16>,
+    parameter_json: Option<serde_json::Value>,
 }
 
 fn default_byte_order() -> String {
@@ -529,6 +624,7 @@ fn default_byte_order() -> String {
 struct SyncResult {
     applied: bool,
     revision: String,
+    channels: usize,
     devices: usize,
     models: usize,
     cloud_acknowledged: bool,
@@ -579,11 +675,16 @@ struct PlatformAlarmRuleDto {
 struct ChannelDto {
     id: String,
     name: String,
+    protocol: String,
     port: String,
     baud: u32,
     data_bits: u8,
     stop_bits: u8,
     parity: String,
+    timeout_ms: u64,
+    retry_count: u32,
+    poll_interval_seconds: u64,
+    config_source: String,
     enabled: bool,
 }
 
@@ -596,8 +697,18 @@ struct ChannelRequest {
     data_bits: u8,
     stop_bits: u8,
     parity: String,
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
+    #[serde(default = "default_retry_count")]
+    retry_count: u32,
+    #[serde(default = "default_poll_interval_seconds")]
+    poll_interval_seconds: u64,
     enabled: bool,
 }
+
+fn default_timeout_ms() -> u64 { 1_000 }
+fn default_retry_count() -> u32 { 2 }
+fn default_poll_interval_seconds() -> u64 { 300 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -620,7 +731,12 @@ struct ThingPointDto {
     function_code: u8,
     address: u16,
     quantity: u16,
+    field_offset: u16,
+    field_quantity: u16,
+    bit_offset: Option<u8>,
+    bit_length: Option<u8>,
     data_type: String,
+    byte_order: String,
     scale: f64,
     offset: f64,
 }
@@ -630,6 +746,9 @@ pub fn router(state: WebState, web_root: PathBuf) -> Router {
     let static_files = ServeDir::new(web_root).fallback(ServeFile::new(index));
     Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/camera/devices", get(camera_devices))
+        .route("/api/v1/camera/stream", get(camera_stream))
+        .route("/api/v1/camera/snapshot", get(camera_snapshot))
         .route("/api/v1/system/environment", get(system_environment))
         .route("/api/v1/system/diagnostics", get(system_diagnostics))
         .route("/api/v1/system/restart-service", post(restart_service))
@@ -854,6 +973,302 @@ async fn health(State(state): State<WebState>) -> ApiResult<HealthResponse> {
     }))
 }
 
+async fn camera_devices() -> ApiResult<Vec<CameraDeviceDto>> {
+    Ok(Json(discover_camera_devices()))
+}
+
+async fn camera_stream(Query(query): Query<CameraStreamQuery>) -> Result<Response, ApiError> {
+    stop_camera_live_processes().await;
+    let device = select_camera_device(&query)?;
+    let width = query.width.unwrap_or(640).clamp(160, 1280);
+    let height = query.height.unwrap_or(480).clamp(120, 720);
+    let fps = query.fps.unwrap_or(10).clamp(1, 20);
+    let fps_text = fps.to_string();
+    let device_arg = format!("device={}", device.path);
+    let caps_arg = format!("video/x-raw,format=NV12,width={width},height={height},framerate={fps_text}/1");
+    let capture_id = format!(
+        "park-gateway-camera-live-{}-{}",
+        std::process::id(),
+        Local::now().timestamp_millis()
+    );
+    let output_pattern = format!("/tmp/{capture_id}-%05d.jpg");
+    let _ = TokioCommand::new("v4l2-ctl")
+        .args([
+            "-d",
+            &device.path,
+            "-c",
+            "auto_exposure=0,gain_automatic=1,white_balance_automatic=1",
+        ])
+        .output()
+        .await;
+    let mut command = TokioCommand::new("gst-launch-1.0");
+    command
+        .args([
+            "-q",
+            "v4l2src",
+            &device_arg,
+            "!",
+            &caps_arg,
+            "!",
+            "jpegenc",
+            "!",
+            "multifilesink",
+            &format!("location={output_pattern}"),
+            "max-files=32",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let child = command
+        .spawn()
+        .map_err(|error| ApiError::unavailable(format!("摄像头流启动失败: {error}")))?;
+    struct CameraLiveState {
+        child: tokio::process::Child,
+        capture_id: String,
+        last_index: u32,
+    }
+    let stream = stream::unfold(
+        CameraLiveState {
+            child,
+            capture_id,
+            last_index: 2,
+        },
+        |mut state| async move {
+            loop {
+                if matches!(state.child.try_wait(), Ok(Some(_))) {
+                    return None;
+                }
+                if let Some((index, path)) =
+                    latest_camera_live_frame(&state.capture_id, state.last_index)
+                {
+                    let image = fs::read(&path).unwrap_or_default();
+                    let _ = fs::remove_file(&path);
+                    cleanup_camera_live_frames(&state.capture_id, index);
+                    state.last_index = index;
+                    if !image.is_empty() {
+                        let mut part = Vec::with_capacity(image.len() + 128);
+                        part.extend_from_slice(b"--park-gateway-camera\r\n");
+                        part.extend_from_slice(b"Content-Type: image/jpeg\r\n");
+                        part.extend_from_slice(
+                            format!("Content-Length: {}\r\n\r\n", image.len()).as_bytes(),
+                        );
+                        part.extend_from_slice(&image);
+                        part.extend_from_slice(b"\r\n");
+                        return Some((Ok::<Bytes, std::io::Error>(Bytes::from(part)), state));
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        },
+    );
+    let body = Body::from_stream(stream);
+    Ok((
+        [
+            ("content-type", "multipart/x-mixed-replace; boundary=park-gateway-camera"),
+            ("cache-control", "no-store"),
+            ("x-accel-buffering", "no"),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+fn latest_camera_live_frame(capture_id: &str, last_index: u32) -> Option<(u32, PathBuf)> {
+    let prefix = format!("{capture_id}-");
+    fs::read_dir("/tmp")
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if !file_name.starts_with(&prefix) || !file_name.ends_with(".jpg") {
+                return None;
+            }
+            let index = file_name
+                .trim_start_matches(&prefix)
+                .trim_end_matches(".jpg")
+                .parse::<u32>()
+                .ok()?;
+            (index > last_index).then_some((index, entry.path()))
+        })
+        .max_by_key(|(index, _)| *index)
+}
+
+fn cleanup_camera_live_frames(capture_id: &str, keep_from: u32) {
+    let prefix = format!("{capture_id}-");
+    let Ok(entries) = fs::read_dir("/tmp") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if !file_name.starts_with(&prefix) || !file_name.ends_with(".jpg") {
+            continue;
+        }
+        let Ok(index) = file_name
+            .trim_start_matches(&prefix)
+            .trim_end_matches(".jpg")
+            .parse::<u32>()
+        else {
+            continue;
+        };
+        if index < keep_from {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+async fn camera_snapshot(Query(query): Query<CameraStreamQuery>) -> Result<Response, ApiError> {
+    stop_camera_live_processes().await;
+    let image = capture_camera_frame(&query, 12).await?;
+    Ok((
+        [
+            ("content-type", "image/jpeg"),
+            ("cache-control", "no-store"),
+        ],
+        image,
+    )
+        .into_response())
+}
+
+async fn stop_camera_live_processes() {
+    let _ = TokioCommand::new("sh")
+        .args([
+            "-c",
+            "for pid in $(pgrep -x gst-launch-1.0 2>/dev/null); do args=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null || true); case \"$args\" in *'park-gateway-camera-live-'*) kill \"$pid\" 2>/dev/null || true ;; esac; done",
+        ])
+        .output()
+        .await;
+}
+
+fn select_camera_device(query: &CameraStreamQuery) -> Result<CameraDeviceDto, ApiError> {
+    let devices = discover_camera_devices();
+    if devices.is_empty() {
+        return Err(ApiError::unavailable("未发现可用摄像头设备"));
+    }
+    query
+        .device
+        .as_deref()
+        .and_then(|path| devices.iter().find(|item| item.path == path))
+        .or_else(|| devices.iter().find(|item| item.primary))
+        .or_else(|| devices.first())
+        .cloned()
+        .ok_or_else(|| ApiError::unavailable("未发现可用摄像头设备"))
+}
+
+async fn capture_camera_frame(query: &CameraStreamQuery, buffers: u32) -> Result<Vec<u8>, ApiError> {
+    let _capture_guard = CAMERA_CAPTURE_LOCK.lock().await;
+    let device = select_camera_device(query)?;
+    let width = query.width.unwrap_or(640).clamp(160, 1280);
+    let height = query.height.unwrap_or(480).clamp(120, 720);
+    let fps = query.fps.unwrap_or(10).clamp(1, 20);
+    let fps_text = fps.to_string();
+    let device_arg = format!("device={}", device.path);
+    let caps_arg = format!("video/x-raw,format=NV12,width={width},height={height},framerate={fps_text}/1");
+    let _ = TokioCommand::new("v4l2-ctl")
+        .args([
+            "-d",
+            &device.path,
+            "-c",
+            "auto_exposure=0,gain_automatic=1,white_balance_automatic=1",
+        ])
+        .output()
+        .await;
+    let capture_id = format!(
+        "park-gateway-camera-{}-{}",
+        std::process::id(),
+        Local::now().timestamp_millis()
+    );
+    let output_pattern = format!("/tmp/{capture_id}-%02d.jpg");
+    let mut command = TokioCommand::new("gst-launch-1.0");
+    command
+        .args([
+            "-q",
+            "v4l2src",
+            &device_arg,
+            &format!("num-buffers={}", buffers.max(1)),
+            "!",
+            &caps_arg,
+            "!",
+            "jpegenc",
+            "!",
+            "multifilesink",
+            &format!("location={output_pattern}"),
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(8), command.output())
+    .await
+    .map_err(|_| ApiError::unavailable("摄像头抓图超时"))?
+    .map_err(|error| ApiError::unavailable(format!("摄像头抓图失败: {error}")))?;
+    let latest_path = (0..12)
+        .rev()
+        .map(|index| PathBuf::from(format!("/tmp/{capture_id}-{index:02}.jpg")))
+        .find(|path| path.exists());
+    let image = latest_path
+        .as_ref()
+        .and_then(|path| fs::read(path).ok())
+        .unwrap_or_default();
+    for index in 0..12 {
+        let _ = fs::remove_file(format!("/tmp/{capture_id}-{index:02}.jpg"));
+    }
+    if !output.status.success() || image.is_empty() {
+        let message = String::from_utf8_lossy(&output.stderr);
+        return Err(ApiError::unavailable(format!(
+            "摄像头没有输出画面{}",
+            if message.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", message.trim())
+            }
+        )));
+    }
+    Ok(image)
+}
+
+fn discover_camera_devices() -> Vec<CameraDeviceDto> {
+    let mut devices = Vec::new();
+    let entries = match fs::read_dir("/sys/class/video4linux") {
+        Ok(entries) => entries,
+        Err(_) => return devices,
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if !file_name.starts_with("video") {
+            continue;
+        }
+        let path = format!("/dev/{file_name}");
+        let name = fs::read_to_string(entry.path().join("name"))
+            .map(|value| value.trim().to_string())
+            .unwrap_or_else(|_| file_name.clone());
+        let lower = name.to_ascii_lowercase();
+        let looks_like_capture = lower.contains("mainpath")
+            || lower.contains("selfpath")
+            || lower.contains("camera")
+            || lower.contains("uvc")
+            || lower.contains("ov");
+        if !looks_like_capture {
+            continue;
+        }
+        let primary = file_name == "video0" || lower.contains("mainpath");
+        devices.push(CameraDeviceDto {
+            stream_url: format!("/api/v1/camera/stream?device={path}"),
+            path,
+            name,
+            primary,
+        });
+    }
+    if devices.iter().any(|device| {
+        device.path == "/dev/video0" || device.name.to_ascii_lowercase().contains("mainpath")
+    }) {
+        devices.retain(|device| {
+            device.path == "/dev/video0" || device.name.to_ascii_lowercase().contains("mainpath")
+        });
+    }
+    devices.sort_by_key(|device| (!device.primary, device.path.clone()));
+    devices
+}
+
 async fn snapshot(State(state): State<WebState>) -> ApiResult<GatewaySnapshotDto> {
     Ok(Json(build_snapshot(&state).await?))
 }
@@ -1034,7 +1449,7 @@ async fn power24h(State(state): State<WebState>) -> ApiResult<Vec<PowerPointDto>
             let points = serde_json::from_str::<Vec<(String, f64)>>(&sample.points_json).ok()?;
             let value = points
                 .into_iter()
-                .find(|(code, _)| code == "active_power_total")?
+                .find(|(code, _)| code.eq_ignore_ascii_case("active_power_total"))?
                 .1;
             let device_name = state
                 .store
@@ -1312,11 +1727,16 @@ async fn channels(State(state): State<WebState>) -> ApiResult<Vec<ChannelDto>> {
             .map(|c| ChannelDto {
                 id: c.id,
                 name: c.name,
+                protocol: c.protocol,
                 port: c.port,
                 baud: c.baud,
                 data_bits: c.data_bits,
                 stop_bits: c.stop_bits,
                 parity: c.parity,
+                timeout_ms: c.timeout_ms,
+                retry_count: c.retry_count,
+                poll_interval_seconds: c.poll_interval_s,
+                config_source: c.config_source,
                 enabled: c.enabled,
             })
             .collect(),
@@ -1333,7 +1753,7 @@ async fn create_channel(
         .store
         .upsert_channel(&channel, now_ms())
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    refresh_channel_transport(&state, &channel).await;
+    refresh_channel_transport(&state, &channel).await?;
     send_command(&state, UserCommand::ReloadConfiguration).await?;
     Ok(Json(channel_dto(channel)))
 }
@@ -1348,7 +1768,7 @@ async fn save_channel(
         .store
         .upsert_channel(&channel, now_ms())
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    refresh_channel_transport(&state, &channel).await;
+    refresh_channel_transport(&state, &channel).await?;
     send_command(&state, UserCommand::ReloadConfiguration).await?;
     Ok(Json(Accepted { accepted: true }))
 }
@@ -1404,6 +1824,11 @@ fn channel_record(
     if !matches!(parity.as_str(), "NONE" | "EVEN" | "ODD") {
         return Err(ApiError::bad_request("校验位必须是 NONE、EVEN 或 ODD"));
     }
+    if !(100..=60_000).contains(&body.timeout_ms) || body.retry_count > 10
+        || !(5..=86_400).contains(&body.poll_interval_seconds)
+    {
+        return Err(ApiError::bad_request("超时、重试或默认采集周期超出允许范围"));
+    }
     Ok(gw_store::Rs485ChannelRecord {
         id,
         name: if body.name.trim().is_empty() {
@@ -1411,11 +1836,16 @@ fn channel_record(
         } else {
             body.name.trim().to_string()
         },
+        protocol: "MODBUS_RTU".into(),
         port,
         baud: body.baud,
         data_bits: body.data_bits,
         stop_bits: body.stop_bits,
         parity,
+        timeout_ms: body.timeout_ms,
+        retry_count: body.retry_count,
+        poll_interval_s: body.poll_interval_seconds,
+        config_source: "LOCAL".into(),
         enabled: body.enabled,
     })
 }
@@ -1424,19 +1854,30 @@ fn channel_dto(channel: gw_store::Rs485ChannelRecord) -> ChannelDto {
     ChannelDto {
         id: channel.id,
         name: channel.name,
+        protocol: channel.protocol,
         port: channel.port,
         baud: channel.baud,
         data_bits: channel.data_bits,
         stop_bits: channel.stop_bits,
         parity: channel.parity,
+        timeout_ms: channel.timeout_ms,
+        retry_count: channel.retry_count,
+        poll_interval_seconds: channel.poll_interval_s,
+        config_source: channel.config_source,
         enabled: channel.enabled,
     }
 }
 
-async fn refresh_channel_transport(state: &WebState, channel: &gw_store::Rs485ChannelRecord) {
+async fn refresh_channel_transport(
+    state: &WebState,
+    channel: &gw_store::Rs485ChannelRecord,
+) -> Result<(), ApiError> {
     state.transports.remove(&channel.id);
     if !channel.enabled {
-        return;
+        return Ok(());
+    }
+    if channel.protocol != "MODBUS_RTU" {
+        return Err(ApiError::bad_request(format!("暂不支持通道协议 {}", channel.protocol)));
     }
     let serial = gw_collector::SerialConfig {
         port: channel.port.clone(),
@@ -1444,18 +1885,40 @@ async fn refresh_channel_transport(state: &WebState, channel: &gw_store::Rs485Ch
         data_bits: channel.data_bits,
         stop_bits: channel.stop_bits,
         parity: channel.parity.clone(),
+        timeout_ms: channel.timeout_ms,
+        retry_count: channel.retry_count,
     };
     match gw_collector::ModbusRtuTransport::connect(&serial).await {
-        Ok(transport) => state.transports.insert(
-            channel.id.clone(),
-            Arc::new(tokio::sync::Mutex::new(transport)),
-        ),
-        Err(error) => tracing::error!(
-            channel = %channel.id,
-            port = %channel.port,
-            "RS485 通道建立失败: {error}"
-        ),
+        Ok(transport) => {
+            state.transports.insert(
+                channel.id.clone(),
+                Arc::new(tokio::sync::Mutex::new(transport)),
+            );
+            Ok(())
+        }
+        Err(error) => Err(ApiError::unavailable(format!(
+            "通道 {} 无法打开串口 {}: {error}", channel.id, channel.port
+        ))),
     }
+}
+
+async fn rebuild_channel_transports(state: &WebState) -> Vec<(String, Result<(), String>)> {
+    for channel_id in state.transports.channel_ids() {
+        state.transports.remove(&channel_id);
+    }
+    let channels = match state.store.channels() {
+        Ok(channels) => channels,
+        Err(error) => return vec![("__store__".into(), Err(error.to_string()))],
+    };
+    let mut results = Vec::new();
+    for channel in channels.into_iter().filter(|channel| channel.enabled) {
+        let channel_id = channel.id.clone();
+        let result = refresh_channel_transport(state, &channel)
+            .await
+            .map_err(|error| error.message);
+        results.push((channel_id, result));
+    }
+    results
 }
 
 async fn thing_models(State(state): State<WebState>) -> ApiResult<Vec<ThingModelDto>> {
@@ -1479,7 +1942,12 @@ async fn thing_models(State(state): State<WebState>) -> ApiResult<Vec<ThingModel
                         function_code: p.func,
                         address: p.address,
                         quantity: p.quantity,
+                        field_offset: p.field_offset,
+                        field_quantity: p.field_quantity,
+                        bit_offset: p.bit_offset,
+                        bit_length: p.bit_length,
                         data_type: p.data_type,
+                        byte_order: p.byte_order,
                         scale: p.scale,
                         offset: p.offset,
                     })
@@ -1722,7 +2190,7 @@ async fn sync_platform_config(State(state): State<WebState>) -> ApiResult<SyncRe
     let payload = envelope
         .data
         .ok_or_else(|| ApiError::unavailable("平台未返回配置数据"))?;
-    if payload.models.iter().any(|model| model.points.is_empty()) {
+    if payload.models.iter().any(|model| model.read_blocks.is_empty() || model.fields.is_empty() || model.bindings.is_empty()) {
         let _ = state.store.record_sync_failure(
             Some(&payload.desired_revision),
             "物模型缺少现场采集点",
@@ -1731,6 +2199,60 @@ async fn sync_platform_config(State(state): State<WebState>) -> ApiResult<SyncRe
         return Err(ApiError::bad_request(
             "平台物模型缺少 Modbus 采集点，已拒绝应用",
         ));
+    }
+    let channels = payload
+        .channels
+        .iter()
+        .map(|channel| gw_store::SyncedChannel {
+            channel_id: channel.channel_id.clone(),
+            channel_name: channel.channel_name.clone(),
+            protocol: channel.protocol.clone(),
+            serial_port: channel.serial_port.clone(),
+            baud_rate: channel.baud_rate,
+            data_bits: channel.data_bits,
+            stop_bits: channel.stop_bits,
+            parity: channel.parity.clone(),
+            timeout_ms: channel.timeout_ms,
+            retry_count: channel.retry_count,
+            poll_interval_s: channel.poll_interval_seconds,
+            enabled: channel.enabled,
+        })
+        .collect::<Vec<_>>();
+    let channel_precheck = validate_platform_channels(&channels);
+    let channel_precheck_errors = channel_precheck
+        .iter()
+        .filter_map(|(channel, result)| {
+            result
+                .as_ref()
+                .err()
+                .map(|error| format!("{channel}: {error}"))
+        })
+        .collect::<Vec<_>>();
+    if !channel_precheck_errors.is_empty() {
+        let message = channel_precheck_errors.join("; ");
+        let _ = state
+            .store
+            .record_sync_failure(Some(&payload.desired_revision), &message, now_ms());
+        let _ = client
+            .post(format!(
+                "{}/api/platform/edge/config/ack",
+                base.trim_end_matches('/')
+            ))
+            .header("X-Gateway-Sn", &gateway_sn)
+            .header("X-Gateway-Secret", &secret)
+            .json(&serde_json::json!({
+                "appliedRevision": payload.desired_revision,
+                "configChecksum": payload.config_checksum,
+                "status": "FAILED",
+                "error": message,
+                "portInventory": serial_port_inventory(),
+                "resources": sync_ack_resources(&payload, &channel_precheck)
+            }))
+            .send()
+            .await;
+        return Err(ApiError::unavailable(format!(
+            "平台配置未应用，已保留本地配置: {message}"
+        )));
     }
     let models = payload
         .models
@@ -1741,22 +2263,40 @@ async fn sync_platform_config(State(state): State<WebState>) -> ApiResult<SyncRe
             version: model.version.clone(),
             platform_model_id: model.model_version_id,
             points: model
-                .points
+                .bindings
                 .iter()
-                .map(|point| gw_store::RegisterMapRow {
-                    profile: model.profile_key.clone(),
-                    point_code: point.point_code.clone(),
-                    point_name: point.point_name.clone(),
-                    unit: point.unit.clone(),
-                    func: point.function_code,
-                    address: point.register_address,
-                    quantity: point.register_length,
-                    data_type: point.value_type.to_ascii_lowercase(),
-                    byte_order: point.byte_order.trim().to_ascii_uppercase(),
-                    scale: point.scale_factor,
-                    offset: point.offset_value,
+                .filter_map(|binding| {
+                    let field = model.fields.iter().find(|field| field.id == binding.protocol_field_id)?;
+                    let block = model.read_blocks.iter().find(|block| block.id == field.read_block_id)?;
+                    Some(gw_store::RegisterMapRow {
+                        profile: model.profile_key.clone(),
+                        point_code: normalize_point_code(&binding.point_code),
+                        point_name: field.field_name.clone(),
+                        unit: String::new(),
+                        func: block.function_code,
+                        address: block.start_address,
+                        quantity: block.register_count,
+                        field_offset: field.register_offset,
+                        field_quantity: field.register_length,
+                        bit_offset: field.bit_offset,
+                        bit_length: field.bit_length,
+                        data_type: field.value_type.to_ascii_lowercase(),
+                        byte_order: field.byte_order.trim().to_ascii_uppercase(),
+                        scale: field.decode_factor * binding.canonical_factor,
+                        offset: field.decode_offset * binding.canonical_factor + binding.canonical_offset,
+                    })
                 })
                 .collect(),
+            commands: model.commands.iter().map(|command| gw_store::ProtocolCommandRow {
+                profile: model.profile_key.clone(),
+                command_code: command.command_code.trim().to_ascii_uppercase(),
+                command_name: command.command_name.clone(),
+                function_code: command.function_code,
+                register_address: command.register_address,
+                encode_type: command.encode_type.trim().to_ascii_uppercase(),
+                fixed_value: command.fixed_value,
+                parameter_json: command.parameter_json.as_ref().map(ToString::to_string),
+            }).collect(),
         })
         .collect::<Vec<_>>();
     let devices = payload
@@ -1776,7 +2316,7 @@ async fn sync_platform_config(State(state): State<WebState>) -> ApiResult<SyncRe
         .collect::<Vec<_>>();
     state
         .store
-        .apply_platform_sync(&payload.desired_revision, &models, &devices, now_ms())
+        .apply_platform_sync(&payload.desired_revision, &channels, &models, &devices, now_ms())
         .map_err(|e| {
             let message = format!("配置冲突或写入失败: {e}");
             let _ = state.store.record_sync_failure(
@@ -1786,7 +2326,35 @@ async fn sync_platform_config(State(state): State<WebState>) -> ApiResult<SyncRe
             );
             ApiError::bad_request(message)
         })?;
+    let channel_results = rebuild_channel_transports(&state).await;
+    let channel_errors = channel_results
+        .iter()
+        .filter_map(|(channel, result)| result.as_ref().err().map(|error| format!("{channel}: {error}")))
+        .collect::<Vec<_>>();
+    if !channel_errors.is_empty() {
+        let message = channel_errors.join("; ");
+        let _ = state.store.record_sync_failure(Some(&payload.desired_revision), &message, now_ms());
+        let resources = sync_ack_resources(&payload, &channel_results);
+        let _ = client
+            .post(format!("{}/api/platform/edge/config/ack", base.trim_end_matches('/')))
+            .header("X-Gateway-Sn", &gateway_sn)
+            .header("X-Gateway-Secret", &secret)
+            .json(&serde_json::json!({
+                "appliedRevision": payload.desired_revision,
+                "configChecksum": payload.config_checksum,
+                "status": "FAILED",
+                "error": message,
+                "portInventory": serial_port_inventory(),
+                "resources": resources
+            }))
+            .send()
+            .await;
+        return Err(ApiError::unavailable(format!("平台配置未应用: {message}")));
+    }
     send_command(&state, UserCommand::ReloadConfiguration).await?;
+    state.store
+        .record_sync_applied(&payload.desired_revision, now_ms())
+        .map_err(|error| ApiError::internal(error.to_string()))?;
     let ack = client
         .post(format!(
             "{}/api/platform/edge/config/ack",
@@ -1798,7 +2366,8 @@ async fn sync_platform_config(State(state): State<WebState>) -> ApiResult<SyncRe
             "appliedRevision": payload.desired_revision,
             "configChecksum": payload.config_checksum,
             "status": "APPLIED",
-            "resources": sync_ack_resources(&payload)
+            "portInventory": serial_port_inventory(),
+            "resources": sync_ack_resources(&payload, &channel_results)
         }))
         .send()
         .await
@@ -1807,14 +2376,82 @@ async fn sync_platform_config(State(state): State<WebState>) -> ApiResult<SyncRe
     Ok(Json(SyncResult {
         applied: true,
         revision: payload.desired_revision,
+        channels: channels.len(),
         devices: devices.len(),
         models: models.len(),
         cloud_acknowledged: ack,
     }))
 }
 
-fn sync_ack_resources(payload: &SyncPayload) -> Vec<serde_json::Value> {
+fn serial_port_inventory() -> Vec<serde_json::Value> {
+    tokio_serial::available_ports()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|port| serde_json::json!({
+            "portKey": port.port_name,
+            "systemPath": port.port_name,
+            "portType": format!("{:?}", port.port_type),
+            "available": true
+        }))
+        .collect()
+}
+
+fn validate_platform_channels(
+    channels: &[gw_store::SyncedChannel],
+) -> Vec<(String, Result<(), String>)> {
+    channels
+        .iter()
+        .map(|channel| {
+            let result = if !channel.enabled {
+                Ok(())
+            } else if channel.protocol.trim().to_ascii_uppercase() != "MODBUS_RTU" {
+                Err(format!("暂不支持通道协议 {}", channel.protocol))
+            } else {
+                let port = channel.serial_port.trim();
+                if port.is_empty() {
+                    Err("平台未下发串口路径".to_string())
+                } else if !FsPath::new(port).exists() {
+                    let inventory = serial_port_inventory()
+                        .into_iter()
+                        .filter_map(|item| {
+                            item.get("systemPath")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_string)
+                        })
+                        .collect::<Vec<_>>();
+                    let hint = if inventory.is_empty() {
+                        "当前系统未枚举到可用串口".to_string()
+                    } else {
+                        format!("当前可用串口: {}", inventory.join(", "))
+                    };
+                    Err(format!("平台下发串口 {port} 不存在，{hint}"))
+                } else {
+                    Ok(())
+                }
+            };
+            (channel.channel_id.clone(), result)
+        })
+        .collect()
+}
+
+fn sync_ack_resources(
+    payload: &SyncPayload,
+    channel_results: &[(String, Result<(), String>)],
+) -> Vec<serde_json::Value> {
     let mut resources = Vec::new();
+    for channel in &payload.channels {
+        let result = channel_results.iter().find(|(id, _)| id == &channel.channel_id);
+        let error = result.and_then(|(_, value)| value.as_ref().err()).cloned();
+        resources.push(serde_json::json!({
+            "resourceType": "CHANNEL",
+            "resourceKey": channel.channel_id,
+            "status": if error.is_some() { "FAILED" } else { "APPLIED" },
+            "message": error.unwrap_or_else(|| format!(
+                "{} {} {}{}{}", channel.serial_port, channel.baud_rate,
+                channel.data_bits, channel.parity, channel.stop_bits
+            ))
+        }));
+    }
     for device in &payload.devices {
         resources.push(serde_json::json!({
             "resourceType": "DEVICE",
@@ -1828,14 +2465,19 @@ fn sync_ack_resources(payload: &SyncPayload) -> Vec<serde_json::Value> {
             "resourceType": "MODEL",
             "resourceKey": format!("{}:{}", model.profile_key, model.version),
             "status": "APPLIED",
-            "message": format!("{} 个点", model.points.len())
+            "message": format!("{} 个读块 / {} 个字段 / {} 个测点", model.read_blocks.len(), model.fields.len(), model.bindings.len())
         }));
-        for point in &model.points {
+        for binding in &model.bindings {
+            let field = model.fields.iter().find(|item| item.id == binding.protocol_field_id);
+            let block = field.and_then(|item| model.read_blocks.iter().find(|block| block.id == item.read_block_id));
             resources.push(serde_json::json!({
                 "resourceType": "POINT",
-                "resourceKey": format!("{}:{}:{}", model.profile_key, model.version, point.point_code),
+                "resourceKey": format!("{}:{}:{}", model.profile_key, model.version, binding.point_code),
                 "status": "APPLIED",
-                "message": format!("FC{} @{} x{} {}", point.function_code, point.register_address, point.register_length, point.byte_order)
+                "message": match (field, block) {
+                    (Some(field), Some(block)) => format!("FC{} @{}+{} x{} {}", block.function_code, block.start_address, field.register_offset, field.register_length, field.byte_order),
+                    _ => "绑定引用缺失".to_string()
+                }
             }));
         }
     }
@@ -2037,7 +2679,7 @@ fn load_commands(store: &Store, limit: u32) -> Result<Vec<CommandDto>, ApiError>
 
 fn load_uploads(store: &Store, limit: u32) -> Result<Vec<UploadDto>, ApiError> {
     let rows = store
-        .pending_outbox(limit)
+        .recent_outbox(limit)
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(rows
         .into_iter()
@@ -2072,12 +2714,33 @@ fn load_uploads(store: &Store, limit: u32) -> Result<Vec<UploadDto>, ApiError> {
                 device_sn,
                 points,
                 r#type: "DATA_UPLOAD".into(),
-                access_status: "PENDING".into(),
-                data_status: "WAITING".into(),
+                access_status: upload_access_status(&row.status).into(),
+                data_status: upload_data_status(&row.status, row.last_error.as_deref()).into(),
                 latency: 0,
             }
         })
         .collect())
+}
+
+fn upload_access_status(status: &str) -> &'static str {
+    match status.to_ascii_lowercase().as_str() {
+        "sent" => "FORWARDED",
+        "pending" => "PENDING",
+        "deferred" => "DEFERRED",
+        _ => "FAILED",
+    }
+}
+
+fn upload_data_status(status: &str, error: Option<&str>) -> String {
+    if let Some(error) = error.filter(|value| !value.trim().is_empty()) {
+        return format!("ERROR: {error}");
+    }
+    match status.to_ascii_lowercase().as_str() {
+        "sent" => "CONSUMED".into(),
+        "pending" => "WAITING".into(),
+        "deferred" => "CLOCK_WAIT".into(),
+        _ => "UNKNOWN".into(),
+    }
 }
 
 fn build_meter_list(current: &Snapshot, store: &Store) -> Result<Vec<MeterDto>, ApiError> {
@@ -2429,7 +3092,7 @@ fn collect_sample_dto(
 }
 
 fn default_unit(code: &str) -> &'static str {
-    match code {
+    match code.to_ascii_lowercase().as_str() {
         c if c.starts_with("voltage_") => "V",
         c if c.starts_with("current_") => "A",
         "active_power_total" => "kW",
@@ -2439,6 +3102,10 @@ fn default_unit(code: &str) -> &'static str {
         "frequency" => "Hz",
         _ => "",
     }
+}
+
+fn normalize_point_code(code: &str) -> String {
+    code.trim().to_ascii_lowercase()
 }
 
 fn quality_label(quality: u32) -> &'static str {

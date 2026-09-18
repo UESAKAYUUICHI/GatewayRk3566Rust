@@ -87,6 +87,8 @@ fn main() -> anyhow::Result<()> {
                 data_bits: channel.data_bits,
                 stop_bits: channel.stop_bits,
                 parity: channel.parity.clone(),
+                timeout_ms: channel.timeout_ms,
+                retry_count: channel.retry_count,
             };
             match gw_collector::ModbusRtuTransport::connect(&serial).await {
                 Ok(transport) => {

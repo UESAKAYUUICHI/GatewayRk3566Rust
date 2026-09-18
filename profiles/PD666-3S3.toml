@@ -1,6 +1,6 @@
 # PD666-3S3 交流电表寄存器档案（Modbus RTU，保持寄存器）
 # name 必须与 meter.profile 字段一致；point 键与上报报文 points 一致，
-# 云侧 dev_point_mapping.source_path（$.xxx）据此映射为标准测点。
+# point 使用云端产品版本定义的标准测点编码。
 # data_type: u16 | u32 | i32（u32/i32 高字在前）；物理值 = 原始值 × scale + offset
 
 name = "PD666-3S3"

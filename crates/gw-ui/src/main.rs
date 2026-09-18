@@ -236,6 +236,8 @@ fn main() -> anyhow::Result<()> {
             data_bits: bootstrap.serial.data_bits,
             stop_bits: bootstrap.serial.stop_bits,
             parity: bootstrap.serial.parity.clone(),
+            timeout_ms: 1_000,
+            retry_count: 2,
         };
         let connected = gw_collector::ModbusRtuTransport::connect(&serial)
             .await

@@ -43,7 +43,7 @@ impl MeterRuntime {
         };
         let last_total_kwh = last_points
             .iter()
-            .find(|(k, _)| k == FORWARD_ACTIVE_ENERGY)
+            .find(|(k, _)| k.eq_ignore_ascii_case(FORWARD_ACTIVE_ENERGY))
             .map(|(_, v)| *v);
         Self {
             record,

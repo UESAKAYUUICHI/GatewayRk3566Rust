@@ -1,6 +1,6 @@
 # 冒烟/联调用配置：本地库 + 短采集周期
 tz_offset_s = 28800
-db_path = "D:/Code/EC-EnergySys/GatewayRk3566Rust/smoke.db"
+db_path = "./smoke.db"
 profiles_dir = "./profiles"
 
 [cloud]
@@ -13,8 +13,11 @@ report_interval_s = 300
 data_interval_s = 2
 
 [serial]
-port = "/dev/ttyS3"
+port = "COM10"
 baud = 9600
+data_bits = 8
+stop_bits = 1
+parity = "N"
 
 [[meter]]
 device_sn = "WZBC-LS2-M-325"

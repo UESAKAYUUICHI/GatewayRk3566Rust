@@ -71,9 +71,9 @@ async fn main() -> anyhow::Result<()> {
         {
             channel.port = bootstrap.serial.port.clone();
             channel.baud = bootstrap.serial.baud;
-            channel.data_bits = bootstrap.serial.data_bits;
-            channel.stop_bits = bootstrap.serial.stop_bits;
-            channel.parity = bootstrap.serial.parity.clone();
+                channel.data_bits = bootstrap.serial.data_bits;
+                channel.stop_bits = bootstrap.serial.stop_bits;
+                channel.parity = bootstrap.serial.parity.clone();
             store.upsert_channel(&channel, 0)?;
         }
         store.set_config("rs485_initialized", "1")?;
@@ -107,6 +107,8 @@ async fn main() -> anyhow::Result<()> {
             data_bits: channel.data_bits,
             stop_bits: channel.stop_bits,
             parity: channel.parity.clone(),
+            timeout_ms: channel.timeout_ms,
+            retry_count: channel.retry_count,
         };
         match gw_collector::ModbusRtuTransport::connect(&serial).await {
             Ok(transport) => {

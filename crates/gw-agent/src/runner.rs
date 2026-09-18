@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gw_collector::MeterTransport;
+use gw_collector::{MeterTransport, ModbusRtuTransport, SerialConfig};
 use gw_collector::profile::{DataType, MeterProfile, RegisterSpec};
 use gw_core::clock::{ClockAssessor, ClockTrust};
 use gw_core::command::{self, GatewayAction};
@@ -311,6 +311,10 @@ fn import_profiles(store: &Store, bootstrap: &BootstrapConfig) {
                         func: spec.func,
                         address: spec.address,
                         quantity: spec.quantity,
+                        field_offset: 0,
+                        field_quantity: spec.quantity,
+                        bit_offset: None,
+                        bit_length: None,
                         data_type: spec.data_type.as_str().to_string(),
                         byte_order: spec.byte_order.trim().to_ascii_uppercase(),
                         scale: spec.scale,
@@ -379,44 +383,48 @@ fn seed_meters(store: &Store, bootstrap: &BootstrapConfig, now_ms: u64) {
 }
 
 /// 档案行 → 解码规格。
-fn specs_of(rows: &[gw_store::RegisterMapRow]) -> Vec<RegisterSpec> {
+fn specs_of(rows: &[gw_store::RegisterMapRow]) -> Vec<gw_store::RegisterMapRow> {
     rows.iter()
-        .filter_map(|row| {
-            DataType::parse(&row.data_type).map(|data_type| RegisterSpec {
-                point: row.point_code.clone(),
-                func: row.func,
-                address: row.address,
-                quantity: row.quantity,
-                data_type,
-                byte_order: row.byte_order.clone(),
-                scale: row.scale,
-                offset: row.offset,
-            })
-        })
+        .filter(|row| row.data_type.eq_ignore_ascii_case("boolean") || DataType::parse(&row.data_type).is_some())
+        .cloned()
         .collect()
 }
 
-/// 采集一表：逐寄存器读取并按档案解码。
-async fn poll_once(
-    transport: &Mutex<dyn MeterTransport>,
+/// Read each block once, then split fields and map them to canonical point codes.
+async fn poll_once<T: MeterTransport + ?Sized>(
+    transport: &Mutex<T>,
     meter: &MeterRecord,
-    specs: &[RegisterSpec],
+    specs: &[gw_store::RegisterMapRow],
 ) -> Result<Vec<(String, f64)>, gw_collector::TransportError> {
     let mut guard = transport.lock().await;
-    let mut words: HashMap<u16, Vec<u16>> = HashMap::new();
+    let mut words: HashMap<(u8, u16, u16), Vec<u16>> = HashMap::new();
     for spec in specs {
-        let got = guard
-            .read_registers(spec.func, meter.modbus_addr, spec.address, spec.quantity)
-            .await?;
-        words.insert(spec.address, got);
+        let key = (spec.func, spec.address, spec.quantity);
+        if let std::collections::hash_map::Entry::Vacant(entry) = words.entry(key) {
+            let got = guard.read_registers(spec.func, meter.modbus_addr, spec.address, spec.quantity).await?;
+            entry.insert(got);
+        }
     }
     let mut points: Vec<(String, f64)> = Vec::with_capacity(specs.len());
     for spec in specs {
-        if let Some(w) = words.get(&spec.address) {
-            if w.len() >= spec.quantity as usize {
-                points.push((spec.point.clone(), MeterProfile::decode_one(spec, w)));
-            }
-        }
+        let Some(block) = words.get(&(spec.func, spec.address, spec.quantity)) else { continue };
+        let start = spec.field_offset as usize;
+        let end = start + spec.field_quantity as usize;
+        if end > block.len() { continue; }
+        let value = if let Some(bit_offset) = spec.bit_offset {
+            let width = spec.bit_length.unwrap_or(1).min(16);
+            let mask = if width == 16 { u16::MAX } else { (1u16 << width) - 1 };
+            ((block[start] >> bit_offset) & mask) as f64 * spec.scale + spec.offset
+        } else {
+            let Some(data_type) = DataType::parse(&spec.data_type) else { continue };
+            let field = RegisterSpec {
+                point: spec.point_code.clone(), func: spec.func, address: 0,
+                quantity: spec.field_quantity, data_type, byte_order: spec.byte_order.clone(),
+                scale: spec.scale, offset: spec.offset,
+            };
+            MeterProfile::decode_one(&field, &block[start..end])
+        };
+        points.push((spec.point_code.clone(), value));
     }
     Ok(points)
 }
@@ -486,7 +494,7 @@ async fn poller_task(ctx: TaskCtx, meter_id: i64, shutdown: CancellationToken) {
             continue;
         }
         let specs = specs_of(&rows);
-        let Some(transport) = ctx.transports.get(&meter.record.channel_id) else {
+        let Some(transport) = ensure_channel_transport(&ctx, &meter).await else {
             handle_channel_unavailable(&ctx, &meter);
             continue;
         };
@@ -500,6 +508,66 @@ async fn poller_task(ctx: TaskCtx, meter_id: i64, shutdown: CancellationToken) {
         match poll_once(&transport, &meter.record, &specs).await {
             Ok(points) => handle_sample(&ctx, &meter, points).await,
             Err(e) => handle_poll_failure(&ctx, &meter, e),
+        }
+    }
+}
+
+async fn ensure_channel_transport(
+    ctx: &TaskCtx,
+    meter: &MeterRuntime,
+) -> Option<crate::transport_registry::TransportHandle> {
+    if let Some(transport) = ctx.transports.get(&meter.record.channel_id) {
+        return Some(transport);
+    }
+    let channel = match ctx.store.channels() {
+        Ok(channels) => channels
+            .into_iter()
+            .find(|channel| channel.id == meter.record.channel_id && channel.enabled),
+        Err(error) => {
+            ctx.emitter.emit(
+                "WARN",
+                "poller",
+                format!("读取 RS485 通道配置失败: {error}"),
+            );
+            None
+        }
+    }?;
+    let protocol = channel.protocol.trim().to_ascii_uppercase();
+    if protocol != "MODBUS_RTU" {
+        ctx.emitter.emit(
+            "WARN",
+            "poller",
+            format!("通道 {} 协议 {protocol} 暂不支持", channel.id),
+        );
+        return None;
+    }
+    let serial = SerialConfig {
+        port: channel.port.clone(),
+        baud: channel.baud,
+        data_bits: channel.data_bits,
+        stop_bits: channel.stop_bits,
+        parity: channel.parity.clone(),
+        timeout_ms: channel.timeout_ms,
+        retry_count: channel.retry_count,
+    };
+    match ModbusRtuTransport::connect(&serial).await {
+        Ok(transport) => {
+            let handle = Arc::new(Mutex::new(transport));
+            ctx.transports.insert(channel.id.clone(), handle.clone());
+            ctx.emitter.emit(
+                "INFO",
+                "poller",
+                format!("RS485 通道 {} 已自动恢复: {}", channel.id, channel.port),
+            );
+            Some(handle)
+        }
+        Err(error) => {
+            ctx.emitter.emit(
+                "WARN",
+                "poller",
+                format!("RS485 通道 {} 自动恢复失败: {error}", channel.id),
+            );
+            None
         }
     }
 }
@@ -527,7 +595,7 @@ async fn handle_sample(ctx: &TaskCtx, meter: &MeterRuntime, points: Vec<(String,
     );
     let total = points
         .iter()
-        .find(|(k, _)| k == FORWARD_ACTIVE_ENERGY)
+        .find(|(k, _)| k.eq_ignore_ascii_case(FORWARD_ACTIVE_ENERGY))
         .map(|(_, v)| *v);
 
     let verdict = energy::evaluate(meter.last_total_kwh, total.unwrap_or(f64::NAN));
@@ -1005,6 +1073,18 @@ async fn handle_raw_command(ctx: &TaskCtx, reboot: &Arc<dyn RebootHook>, raw: Ra
     if body.command_id.is_empty() {
         return;
     }
+    if let Ok(Some((status, message))) = ctx.store.command_result(&body.command_id) {
+        let response = if status == "SUCCESS" {
+            proto::CommandResponse::success(&body.command_id, message, now)
+        } else {
+            proto::CommandResponse::failed(&body.command_id, message, now)
+        };
+        let topic = topics::command_response_topic(&ctx.state.gateway_id());
+        if let Ok(bytes) = serde_json::to_vec(&response) {
+            let _ = ctx.link.publish(&topic, &bytes).await;
+        }
+        return;
+    }
     let action = command::interpret(&body);
     let gateway_id = ctx.state.gateway_id();
     let response = match &action {
@@ -1060,6 +1140,65 @@ async fn handle_raw_command(ctx: &TaskCtx, reboot: &Arc<dyn RebootHook>, raw: Ra
                 reboot.reboot();
             });
             response
+        }
+        GatewayAction::DeviceCommand { target_sn, command_code } => {
+            if command_code.is_empty() {
+                proto::CommandResponse::failed(&body.command_id, "commandCode 不能为空", now)
+            } else if let Some(meter) = ctx.state.meter_by_sn(target_sn) {
+                match ctx.store.protocol_command(&meter.record.profile, command_code) {
+                    Ok(Some(command)) if command.function_code == 6
+                        && command.encode_type.eq_ignore_ascii_case("FIXED")
+                        && command.fixed_value.is_some() => {
+                        match ctx.transports.get(&meter.record.channel_id) {
+                            Some(transport) => {
+                                let mut guard = transport.lock().await;
+                                match guard.write_single_register(
+                                    meter.record.modbus_addr,
+                                    command.register_address,
+                                    command.fixed_value.unwrap_or_default(),
+                                ).await {
+                                    Ok(()) => proto::CommandResponse::success(
+                                        &body.command_id,
+                                        format!("已执行 {}", command.command_name),
+                                        now,
+                                    ),
+                                    Err(error) => proto::CommandResponse::failed(
+                                        &body.command_id,
+                                        format!("设备写入失败: {error}"),
+                                        now,
+                                    ),
+                                }
+                            }
+                            None => proto::CommandResponse::failed(
+                                &body.command_id,
+                                format!("RS485 通道 {} 未建立传输", meter.record.channel_id),
+                                now,
+                            ),
+                        }
+                    }
+                    Ok(Some(_)) => proto::CommandResponse::failed(
+                        &body.command_id,
+                        "该白名单命令的写入类型暂不受支持",
+                        now,
+                    ),
+                    Ok(None) => proto::CommandResponse::failed(
+                        &body.command_id,
+                        format!("命令未在设备协议白名单中: {command_code}"),
+                        now,
+                    ),
+                    Err(error) => proto::CommandResponse::failed(
+                        &body.command_id,
+                        format!("命令白名单读取失败: {error}"),
+                        now,
+                    ),
+                }
+            } else {
+                proto::CommandResponse::failed(
+                    &body.command_id,
+                    format!("目标设备不存在或停用: {target_sn}"),
+                    now,
+                )
+            }
         }
         GatewayAction::Unknown { kind } => proto::CommandResponse::failed(
             &body.command_id,
@@ -1429,3 +1568,45 @@ async fn maintainer_task(
 
 /// re-export 供 bins 组装。
 pub use gw_core::snapshot::LinkHealth as Health;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct BlockTransport(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl MeterTransport for BlockTransport {
+        async fn read_registers(&mut self, _: u8, _: u8, _: u16, _: u16) -> Result<Vec<u16>, gw_collector::TransportError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![0x8001])
+        }
+    }
+
+    fn bit_row(code: &str, bit: u8) -> gw_store::RegisterMapRow {
+        gw_store::RegisterMapRow {
+            profile: "LIGHTING".into(), point_code: code.into(), point_name: code.into(), unit: String::new(),
+            func: 3, address: 0x007A, quantity: 1, field_offset: 0, field_quantity: 1,
+            bit_offset: Some(bit), bit_length: Some(1), data_type: "boolean".into(), byte_order: "AB".into(),
+            scale: 1.0, offset: 0.0,
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_status_block_is_read_once_and_split_into_bits() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let transport = Mutex::new(BlockTransport(calls.clone()));
+        let meter = MeterRecord {
+            id: 1, device_sn: "LIGHT-001".into(), device_name: "light".into(), modbus_addr: 7,
+            profile: "LIGHTING".into(), channel_id: "rs485-1".into(), config_source: "PLATFORM".into(),
+            platform_device_id: Some(1), model_version: "V1".into(), upload_enabled: true,
+            collect_interval_s: 60, enabled: true, created_ms: 0,
+        };
+        let points = poll_once(&transport, &meter, &[bit_row("LOOP_1_STATUS", 15), bit_row("LOOP_16_STATUS", 0)])
+            .await.expect("block should decode");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(points, vec![("LOOP_1_STATUS".into(), 1.0), ("LOOP_16_STATUS".into(), 1.0)]);
+    }
+}
