@@ -8,3 +8,4 @@ description = "SQLite(WAL) 存储实现：配置/电表档案/outbox/读数/电�
 [dependencies]
 thiserror = { workspace = true }
 rusqlite = { workspace = true }
+serde_json = { workspace = true }

@@ -32,6 +32,14 @@ pub struct GatewayAlarmPayload {
     pub level: String,
     pub device_sn: Option<String>,
     pub point_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub point_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alarm_value: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold_value: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compare_operator: Option<String>,
     pub message: String,
 }
 

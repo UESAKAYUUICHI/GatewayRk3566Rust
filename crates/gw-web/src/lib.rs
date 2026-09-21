@@ -8,8 +8,8 @@ use std::{
 };
 
 use axum::{
-    body::{Body, Bytes},
     Json, Router,
+    body::{Body, Bytes},
     extract::{
         Path, Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
@@ -23,7 +23,10 @@ use futures_util::stream;
 use gw_agent::{BootstrapConfig, TransportRegistry, UserCommand};
 use gw_core::snapshot::{LinkHealth, MeterSnapshot, Snapshot};
 use gw_network::{NetworkManager, NetworkSnapshot, WifiNetwork};
-use gw_store::{AlarmRuleRecord, MeterInput, MeterRecord, Store};
+use gw_store::{
+    AlarmProtocolDeviceRecord, AlarmProtocolPointRecord, AlarmProtocolRecord, AlarmRuleRecord,
+    MeterInput, MeterRecord, Store,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::{mpsc, watch};
@@ -545,7 +548,10 @@ where
         serde_json::Value::Number(value) => Ok(value.as_i64().unwrap_or(0) != 0),
         serde_json::Value::String(value) => {
             let value = value.trim().to_ascii_lowercase();
-            Ok(matches!(value.as_str(), "1" | "true" | "yes" | "y" | "on" | "enabled"))
+            Ok(matches!(
+                value.as_str(),
+                "1" | "true" | "yes" | "y" | "on" | "enabled"
+            ))
         }
         serde_json::Value::Null => Ok(false),
         other => Err(serde::de::Error::custom(format!(
@@ -650,24 +656,50 @@ struct PlatformAlarmDto {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct PlatformAlarmRuleSync {
-    rules: Vec<PlatformAlarmRuleDto>,
+struct PlatformAlarmProtocolSync {
+    protocols: Vec<PlatformAlarmProtocolDto>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct PlatformAlarmRuleDto {
-    rule_code: String,
-    name: String,
-    level: String,
-    device_sn: Option<String>,
-    point_code: String,
-    operator: String,
-    threshold: f64,
-    #[serde(default)]
-    unit: String,
-    duration_s: u64,
+struct PlatformAlarmProtocolDto {
+    protocol_id: i64,
+    protocol_key: String,
+    protocol_name: String,
+    version_no: i64,
+    #[serde(default = "default_true")]
     enabled: bool,
+    #[serde(default)]
+    devices: Vec<PlatformAlarmProtocolDeviceDto>,
+    #[serde(default)]
+    points: Vec<PlatformAlarmProtocolPointDto>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlatformAlarmProtocolDeviceDto {
+    device_sn: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlatformAlarmProtocolPointDto {
+    point_id: i64,
+    point_code: String,
+    point_name: String,
+    alarm_type: i32,
+    alarm_level: i32,
+    compare_operator: String,
+    threshold_value: Option<f64>,
+    threshold_min: Option<f64>,
+    threshold_max: Option<f64>,
+    recovery_threshold_value: Option<f64>,
+    duration_seconds: u64,
+    enabled: i32,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize)]
@@ -706,9 +738,15 @@ struct ChannelRequest {
     enabled: bool,
 }
 
-fn default_timeout_ms() -> u64 { 1_000 }
-fn default_retry_count() -> u32 { 2 }
-fn default_poll_interval_seconds() -> u64 { 300 }
+fn default_timeout_ms() -> u64 {
+    1_000
+}
+fn default_retry_count() -> u32 {
+    2
+}
+fn default_poll_interval_seconds() -> u64 {
+    300
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -757,6 +795,7 @@ pub fn router(state: WebState, web_root: PathBuf) -> Router {
         .route("/api/v1/snapshot", get(snapshot))
         .route("/api/v1/ws", get(websocket))
         .route("/api/v1/metrics/power24h", get(power24h))
+        .route("/api/v1/metrics/weekly", get(weekly_metrics))
         .route("/api/v1/events", get(events))
         .route(
             "/api/v1/events/acknowledge-all",
@@ -770,6 +809,11 @@ pub fn router(state: WebState, web_root: PathBuf) -> Router {
             get(alarm_rules).post(create_alarm_rule),
         )
         .route("/api/v1/alarm-rules/sync", post(sync_platform_alarm_rules))
+        .route(
+            "/api/v1/alarm-protocols/sync",
+            post(sync_platform_alarm_protocols),
+        )
+        .route("/api/v1/alarm-protocols", get(alarm_protocols))
         .route(
             "/api/v1/alarm-rules/config",
             put(save_alarm_rule_sync_config),
@@ -892,6 +936,10 @@ pub async fn sync_platform_alarms_once(state: &WebState) -> Result<usize, ApiErr
 }
 
 pub async fn sync_platform_alarm_rules_once(state: &WebState) -> Result<usize, ApiError> {
+    sync_platform_alarm_protocols_once(state).await
+}
+
+pub async fn sync_platform_alarm_protocols_once(state: &WebState) -> Result<usize, ApiError> {
     let get = |key: &str, fallback: String| {
         state
             .store
@@ -908,12 +956,12 @@ pub async fn sync_platform_alarm_rules_once(state: &WebState) -> Result<usize, A
     let secret = get("mqtt_password", state.bootstrap.cloud.mqtt_password.clone());
     if secret.is_empty() {
         return Err(ApiError::bad_request(
-            "未配置网关密钥，不能同步平台告警规则",
+            "未配置网关密钥，不能同步平台告警协议",
         ));
     }
     let response = reqwest::Client::new()
         .get(format!(
-            "{}/api/platform/edge/config/alarm-rules",
+            "{}/api/platform/edge/config/alarm-protocols",
             base.trim_end_matches('/')
         ))
         .header("X-Gateway-Sn", gateway_sn)
@@ -921,47 +969,127 @@ pub async fn sync_platform_alarm_rules_once(state: &WebState) -> Result<usize, A
         .timeout(Duration::from_secs(10))
         .send()
         .await
-        .map_err(|error| ApiError::unavailable(format!("平台告警规则同步失败: {error}")))?;
+        .map_err(|error| ApiError::unavailable(format!("平台告警协议同步失败: {error}")))?;
     let status = response.status();
-    let envelope: PlatformEnvelope<PlatformAlarmRuleSync> = response
+    let envelope: PlatformEnvelope<PlatformAlarmProtocolSync> = response
         .json()
         .await
-        .map_err(|error| ApiError::unavailable(format!("平台告警规则响应无法解析: {error}")))?;
+        .map_err(|error| ApiError::unavailable(format!("平台告警协议响应无法解析: {error}")))?;
     if !status.is_success() || envelope.code != 0 {
         return Err(ApiError::unavailable(envelope.message));
     }
     let payload = envelope
         .data
-        .ok_or_else(|| ApiError::unavailable("平台未返回告警规则数据"))?;
+        .ok_or_else(|| ApiError::unavailable("平台未返回告警协议数据"))?;
     let now = now_ms();
-    let rules = payload
-        .rules
+    let protocols = payload
+        .protocols
         .into_iter()
-        .map(|rule| AlarmRuleRecord {
-            id: 0,
-            rule_code: rule.rule_code,
-            source: "PLATFORM".into(),
-            name: rule.name,
-            level: rule.level,
-            target_device_sn: rule.device_sn,
-            point_code: rule.point_code,
-            operator: rule.operator,
-            threshold: rule.threshold,
-            unit: rule.unit,
-            duration_s: rule.duration_s,
-            enabled: rule.enabled,
+        .map(|protocol| AlarmProtocolRecord {
+            protocol_id: protocol.protocol_id,
+            protocol_key: protocol.protocol_key,
+            protocol_name: protocol.protocol_name,
+            version_no: protocol.version_no,
+            enabled: protocol.enabled,
             updated_ms: now,
+            devices: protocol
+                .devices
+                .into_iter()
+                .map(|device| AlarmProtocolDeviceRecord {
+                    device_sn: device.device_sn,
+                })
+                .collect(),
+            points: protocol
+                .points
+                .into_iter()
+                .map(|point| AlarmProtocolPointRecord {
+                    point_id: point.point_id,
+                    protocol_id: protocol.protocol_id,
+                    point_code: point.point_code,
+                    point_name: point.point_name,
+                    alarm_type: alarm_type_label(point.alarm_type),
+                    level: alarm_level_label(point.alarm_level),
+                    operator: point.compare_operator,
+                    threshold_value: point.threshold_value,
+                    threshold_min: point.threshold_min,
+                    threshold_max: point.threshold_max,
+                    recovery_threshold_value: point.recovery_threshold_value,
+                    duration_s: point.duration_seconds,
+                    enabled: point.enabled != 0,
+                })
+                .collect(),
         })
         .collect::<Vec<_>>();
     state
         .store
-        .replace_platform_alarm_rules(&rules, now)
+        .replace_platform_alarm_protocols(&protocols, now)
         .map_err(|error| ApiError::internal(error.to_string()))?;
     state
         .store
-        .set_config("alarm_rule_last_sync_ms", &now.to_string())
+        .set_config("alarm_protocol_last_sync_ms", &now.to_string())
         .map_err(|error| ApiError::internal(error.to_string()))?;
-    Ok(rules.len())
+    Ok(protocols.len())
+}
+
+async fn sync_platform_alarm_protocols(State(state): State<WebState>) -> ApiResult<Accepted> {
+    sync_platform_alarm_protocols_once(&state).await?;
+    Ok(Json(Accepted { accepted: true }))
+}
+
+async fn alarm_protocols(State(state): State<WebState>) -> ApiResult<serde_json::Value> {
+    let rows = state
+        .store
+        .alarm_protocols()
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let protocols = rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "protocolId": row.protocol_id,
+                "protocolKey": row.protocol_key,
+                "protocolName": row.protocol_name,
+                "versionNo": row.version_no,
+                "enabled": row.enabled,
+                "devices": row.devices.into_iter().map(|device| serde_json::json!({"deviceSn": device.device_sn})).collect::<Vec<_>>(),
+                "points": row.points.into_iter().map(|point| serde_json::json!({
+                    "pointId": point.point_id,
+                    "pointCode": point.point_code,
+                    "pointName": point.point_name,
+                    "alarmType": point.alarm_type,
+                    "level": point.level,
+                    "operator": point.operator,
+                    "thresholdValue": point.threshold_value,
+                    "thresholdMin": point.threshold_min,
+                    "thresholdMax": point.threshold_max,
+                    "recoveryThresholdValue": point.recovery_threshold_value,
+                    "durationS": point.duration_s,
+                    "enabled": point.enabled
+                })).collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!({ "protocols": protocols })))
+}
+
+fn alarm_type_label(value: i32) -> String {
+    match value {
+        1 => "VOLTAGE",
+        2 => "CURRENT",
+        3 => "POWER",
+        4 => "OFFLINE",
+        _ => "GENERAL",
+    }
+    .into()
+}
+
+fn alarm_level_label(value: i32) -> String {
+    match value {
+        4 => "CRITICAL",
+        3 => "MAJOR",
+        1 => "INFO",
+        _ => "WARN",
+    }
+    .into()
 }
 
 async fn health(State(state): State<WebState>) -> ApiResult<HealthResponse> {
@@ -985,7 +1113,8 @@ async fn camera_stream(Query(query): Query<CameraStreamQuery>) -> Result<Respons
     let fps = query.fps.unwrap_or(10).clamp(1, 20);
     let fps_text = fps.to_string();
     let device_arg = format!("device={}", device.path);
-    let caps_arg = format!("video/x-raw,format=NV12,width={width},height={height},framerate={fps_text}/1");
+    let caps_arg =
+        format!("video/x-raw,format=NV12,width={width},height={height},framerate={fps_text}/1");
     let capture_id = format!(
         "park-gateway-camera-live-{}-{}",
         std::process::id(),
@@ -1065,7 +1194,10 @@ async fn camera_stream(Query(query): Query<CameraStreamQuery>) -> Result<Respons
     let body = Body::from_stream(stream);
     Ok((
         [
-            ("content-type", "multipart/x-mixed-replace; boundary=park-gateway-camera"),
+            (
+                "content-type",
+                "multipart/x-mixed-replace; boundary=park-gateway-camera",
+            ),
             ("cache-control", "no-store"),
             ("x-accel-buffering", "no"),
         ],
@@ -1155,7 +1287,10 @@ fn select_camera_device(query: &CameraStreamQuery) -> Result<CameraDeviceDto, Ap
         .ok_or_else(|| ApiError::unavailable("未发现可用摄像头设备"))
 }
 
-async fn capture_camera_frame(query: &CameraStreamQuery, buffers: u32) -> Result<Vec<u8>, ApiError> {
+async fn capture_camera_frame(
+    query: &CameraStreamQuery,
+    buffers: u32,
+) -> Result<Vec<u8>, ApiError> {
     let _capture_guard = CAMERA_CAPTURE_LOCK.lock().await;
     let device = select_camera_device(query)?;
     let width = query.width.unwrap_or(640).clamp(160, 1280);
@@ -1163,7 +1298,8 @@ async fn capture_camera_frame(query: &CameraStreamQuery, buffers: u32) -> Result
     let fps = query.fps.unwrap_or(10).clamp(1, 20);
     let fps_text = fps.to_string();
     let device_arg = format!("device={}", device.path);
-    let caps_arg = format!("video/x-raw,format=NV12,width={width},height={height},framerate={fps_text}/1");
+    let caps_arg =
+        format!("video/x-raw,format=NV12,width={width},height={height},framerate={fps_text}/1");
     let _ = TokioCommand::new("v4l2-ctl")
         .args([
             "-d",
@@ -1198,9 +1334,9 @@ async fn capture_camera_frame(query: &CameraStreamQuery, buffers: u32) -> Result
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     let output = tokio::time::timeout(Duration::from_secs(8), command.output())
-    .await
-    .map_err(|_| ApiError::unavailable("摄像头抓图超时"))?
-    .map_err(|error| ApiError::unavailable(format!("摄像头抓图失败: {error}")))?;
+        .await
+        .map_err(|_| ApiError::unavailable("摄像头抓图超时"))?
+        .map_err(|error| ApiError::unavailable(format!("摄像头抓图失败: {error}")))?;
     let latest_path = (0..12)
         .rev()
         .map(|index| PathBuf::from(format!("/tmp/{capture_id}-{index:02}.jpg")))
@@ -1476,6 +1612,66 @@ async fn power24h(State(state): State<WebState>) -> ApiResult<Vec<PowerPointDto>
         })
         .collect();
     Ok(Json(rows))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WeeklyMetricDto {
+    meter_id: i64,
+    device_sn: String,
+    device_name: String,
+    week_start_ms: u64,
+    week_end_ms: u64,
+    sample_count: u64,
+    normal_count: u64,
+    first_read_ms: u64,
+    last_read_ms: u64,
+    first_energy_kwh: Option<f64>,
+    last_energy_kwh: Option<f64>,
+    delta_kwh: f64,
+    avg_power_kw: Option<f64>,
+    min_voltage_v: Option<f64>,
+    max_voltage_v: Option<f64>,
+}
+
+async fn weekly_metrics(
+    State(state): State<WebState>,
+    Query(query): Query<LimitQuery>,
+) -> ApiResult<Vec<WeeklyMetricDto>> {
+    let now = now_ms();
+    let from = now.saturating_sub(52 * 7 * 24 * 60 * 60 * 1000);
+    let rows = state
+        .store
+        .weekly_summaries_since(from, query.limit.unwrap_or(520).min(2_000))
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| {
+                let device_name = if row.device_name.is_empty() {
+                    row.device_sn.clone()
+                } else {
+                    row.device_name.clone()
+                };
+                WeeklyMetricDto {
+                    meter_id: row.meter_id,
+                    device_sn: row.device_sn,
+                    device_name,
+                    week_start_ms: row.week_start_ms,
+                    week_end_ms: row.week_end_ms,
+                    sample_count: row.sample_count,
+                    normal_count: row.normal_count,
+                    first_read_ms: row.first_read_ms,
+                    last_read_ms: row.last_read_ms,
+                    first_energy_kwh: row.first_energy_kwh,
+                    last_energy_kwh: row.last_energy_kwh,
+                    delta_kwh: row.delta_kwh,
+                    avg_power_kw: row.avg_power_kw,
+                    min_voltage_v: row.min_voltage_v,
+                    max_voltage_v: row.max_voltage_v,
+                }
+            })
+            .collect(),
+    ))
 }
 
 async fn commands(
@@ -1824,10 +2020,13 @@ fn channel_record(
     if !matches!(parity.as_str(), "NONE" | "EVEN" | "ODD") {
         return Err(ApiError::bad_request("校验位必须是 NONE、EVEN 或 ODD"));
     }
-    if !(100..=60_000).contains(&body.timeout_ms) || body.retry_count > 10
+    if !(100..=60_000).contains(&body.timeout_ms)
+        || body.retry_count > 10
         || !(5..=86_400).contains(&body.poll_interval_seconds)
     {
-        return Err(ApiError::bad_request("超时、重试或默认采集周期超出允许范围"));
+        return Err(ApiError::bad_request(
+            "超时、重试或默认采集周期超出允许范围",
+        ));
     }
     Ok(gw_store::Rs485ChannelRecord {
         id,
@@ -1877,7 +2076,10 @@ async fn refresh_channel_transport(
         return Ok(());
     }
     if channel.protocol != "MODBUS_RTU" {
-        return Err(ApiError::bad_request(format!("暂不支持通道协议 {}", channel.protocol)));
+        return Err(ApiError::bad_request(format!(
+            "暂不支持通道协议 {}",
+            channel.protocol
+        )));
     }
     let serial = gw_collector::SerialConfig {
         port: channel.port.clone(),
@@ -1897,7 +2099,8 @@ async fn refresh_channel_transport(
             Ok(())
         }
         Err(error) => Err(ApiError::unavailable(format!(
-            "通道 {} 无法打开串口 {}: {error}", channel.id, channel.port
+            "通道 {} 无法打开串口 {}: {error}",
+            channel.id, channel.port
         ))),
     }
 }
@@ -2190,7 +2393,9 @@ async fn sync_platform_config(State(state): State<WebState>) -> ApiResult<SyncRe
     let payload = envelope
         .data
         .ok_or_else(|| ApiError::unavailable("平台未返回配置数据"))?;
-    if payload.models.iter().any(|model| model.read_blocks.is_empty() || model.fields.is_empty() || model.bindings.is_empty()) {
+    if payload.models.iter().any(|model| {
+        model.read_blocks.is_empty() || model.fields.is_empty() || model.bindings.is_empty()
+    }) {
         let _ = state.store.record_sync_failure(
             Some(&payload.desired_revision),
             "物模型缺少现场采集点",
@@ -2230,9 +2435,10 @@ async fn sync_platform_config(State(state): State<WebState>) -> ApiResult<SyncRe
         .collect::<Vec<_>>();
     if !channel_precheck_errors.is_empty() {
         let message = channel_precheck_errors.join("; ");
-        let _ = state
-            .store
-            .record_sync_failure(Some(&payload.desired_revision), &message, now_ms());
+        let _ =
+            state
+                .store
+                .record_sync_failure(Some(&payload.desired_revision), &message, now_ms());
         let _ = client
             .post(format!(
                 "{}/api/platform/edge/config/ack",
@@ -2266,8 +2472,14 @@ async fn sync_platform_config(State(state): State<WebState>) -> ApiResult<SyncRe
                 .bindings
                 .iter()
                 .filter_map(|binding| {
-                    let field = model.fields.iter().find(|field| field.id == binding.protocol_field_id)?;
-                    let block = model.read_blocks.iter().find(|block| block.id == field.read_block_id)?;
+                    let field = model
+                        .fields
+                        .iter()
+                        .find(|field| field.id == binding.protocol_field_id)?;
+                    let block = model
+                        .read_blocks
+                        .iter()
+                        .find(|block| block.id == field.read_block_id)?;
                     Some(gw_store::RegisterMapRow {
                         profile: model.profile_key.clone(),
                         point_code: normalize_point_code(&binding.point_code),
@@ -2283,20 +2495,25 @@ async fn sync_platform_config(State(state): State<WebState>) -> ApiResult<SyncRe
                         data_type: field.value_type.to_ascii_lowercase(),
                         byte_order: field.byte_order.trim().to_ascii_uppercase(),
                         scale: field.decode_factor * binding.canonical_factor,
-                        offset: field.decode_offset * binding.canonical_factor + binding.canonical_offset,
+                        offset: field.decode_offset * binding.canonical_factor
+                            + binding.canonical_offset,
                     })
                 })
                 .collect(),
-            commands: model.commands.iter().map(|command| gw_store::ProtocolCommandRow {
-                profile: model.profile_key.clone(),
-                command_code: command.command_code.trim().to_ascii_uppercase(),
-                command_name: command.command_name.clone(),
-                function_code: command.function_code,
-                register_address: command.register_address,
-                encode_type: command.encode_type.trim().to_ascii_uppercase(),
-                fixed_value: command.fixed_value,
-                parameter_json: command.parameter_json.as_ref().map(ToString::to_string),
-            }).collect(),
+            commands: model
+                .commands
+                .iter()
+                .map(|command| gw_store::ProtocolCommandRow {
+                    profile: model.profile_key.clone(),
+                    command_code: command.command_code.trim().to_ascii_uppercase(),
+                    command_name: command.command_name.clone(),
+                    function_code: command.function_code,
+                    register_address: command.register_address,
+                    encode_type: command.encode_type.trim().to_ascii_uppercase(),
+                    fixed_value: command.fixed_value,
+                    parameter_json: command.parameter_json.as_ref().map(ToString::to_string),
+                })
+                .collect(),
         })
         .collect::<Vec<_>>();
     let devices = payload
@@ -2316,7 +2533,13 @@ async fn sync_platform_config(State(state): State<WebState>) -> ApiResult<SyncRe
         .collect::<Vec<_>>();
     state
         .store
-        .apply_platform_sync(&payload.desired_revision, &channels, &models, &devices, now_ms())
+        .apply_platform_sync(
+            &payload.desired_revision,
+            &channels,
+            &models,
+            &devices,
+            now_ms(),
+        )
         .map_err(|e| {
             let message = format!("配置冲突或写入失败: {e}");
             let _ = state.store.record_sync_failure(
@@ -2329,14 +2552,25 @@ async fn sync_platform_config(State(state): State<WebState>) -> ApiResult<SyncRe
     let channel_results = rebuild_channel_transports(&state).await;
     let channel_errors = channel_results
         .iter()
-        .filter_map(|(channel, result)| result.as_ref().err().map(|error| format!("{channel}: {error}")))
+        .filter_map(|(channel, result)| {
+            result
+                .as_ref()
+                .err()
+                .map(|error| format!("{channel}: {error}"))
+        })
         .collect::<Vec<_>>();
     if !channel_errors.is_empty() {
         let message = channel_errors.join("; ");
-        let _ = state.store.record_sync_failure(Some(&payload.desired_revision), &message, now_ms());
+        let _ =
+            state
+                .store
+                .record_sync_failure(Some(&payload.desired_revision), &message, now_ms());
         let resources = sync_ack_resources(&payload, &channel_results);
         let _ = client
-            .post(format!("{}/api/platform/edge/config/ack", base.trim_end_matches('/')))
+            .post(format!(
+                "{}/api/platform/edge/config/ack",
+                base.trim_end_matches('/')
+            ))
             .header("X-Gateway-Sn", &gateway_sn)
             .header("X-Gateway-Secret", &secret)
             .json(&serde_json::json!({
@@ -2352,7 +2586,8 @@ async fn sync_platform_config(State(state): State<WebState>) -> ApiResult<SyncRe
         return Err(ApiError::unavailable(format!("平台配置未应用: {message}")));
     }
     send_command(&state, UserCommand::ReloadConfiguration).await?;
-    state.store
+    state
+        .store
         .record_sync_applied(&payload.desired_revision, now_ms())
         .map_err(|error| ApiError::internal(error.to_string()))?;
     let ack = client
@@ -2387,12 +2622,14 @@ fn serial_port_inventory() -> Vec<serde_json::Value> {
     tokio_serial::available_ports()
         .unwrap_or_default()
         .into_iter()
-        .map(|port| serde_json::json!({
-            "portKey": port.port_name,
-            "systemPath": port.port_name,
-            "portType": format!("{:?}", port.port_type),
-            "available": true
-        }))
+        .map(|port| {
+            serde_json::json!({
+                "portKey": port.port_name,
+                "systemPath": port.port_name,
+                "portType": format!("{:?}", port.port_type),
+                "available": true
+            })
+        })
         .collect()
 }
 
@@ -2440,7 +2677,9 @@ fn sync_ack_resources(
 ) -> Vec<serde_json::Value> {
     let mut resources = Vec::new();
     for channel in &payload.channels {
-        let result = channel_results.iter().find(|(id, _)| id == &channel.channel_id);
+        let result = channel_results
+            .iter()
+            .find(|(id, _)| id == &channel.channel_id);
         let error = result.and_then(|(_, value)| value.as_ref().err()).cloned();
         resources.push(serde_json::json!({
             "resourceType": "CHANNEL",
@@ -2468,8 +2707,16 @@ fn sync_ack_resources(
             "message": format!("{} 个读块 / {} 个字段 / {} 个测点", model.read_blocks.len(), model.fields.len(), model.bindings.len())
         }));
         for binding in &model.bindings {
-            let field = model.fields.iter().find(|item| item.id == binding.protocol_field_id);
-            let block = field.and_then(|item| model.read_blocks.iter().find(|block| block.id == item.read_block_id));
+            let field = model
+                .fields
+                .iter()
+                .find(|item| item.id == binding.protocol_field_id);
+            let block = field.and_then(|item| {
+                model
+                    .read_blocks
+                    .iter()
+                    .find(|block| block.id == item.read_block_id)
+            });
             resources.push(serde_json::json!({
                 "resourceType": "POINT",
                 "resourceKey": format!("{}:{}:{}", model.profile_key, model.version, binding.point_code),

@@ -23,7 +23,7 @@ use gw_core::snapshot::{EventLine, MeterSnapshot, Snapshot};
 use gw_link::port::{CloudLink, RawCommand};
 use gw_proto::points::FORWARD_ACTIVE_ENERGY;
 use gw_proto::{self as proto, topics};
-use gw_store::{MeterInput, MeterRecord, Store};
+use gw_store::{AlarmProtocolPointRecord, MeterInput, MeterRecord, Store};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -225,6 +225,7 @@ pub fn spawn_agent(
     tokio::spawn(maintainer_task(
         store.clone(),
         clock.clone(),
+        bootstrap.tz_offset_s,
         shutdown.clone(),
     ));
 
@@ -734,6 +735,174 @@ async fn handle_sample(ctx: &TaskCtx, meter: &MeterRuntime, points: Vec<(String,
     if let Err(e) = result {
         tracing::warn!("读数落库失败: {e}");
     }
+    evaluate_alarm_protocols(ctx, meter, &points);
+}
+
+fn evaluate_alarm_protocols(ctx: &TaskCtx, meter: &MeterRuntime, points: &[(String, f64)]) {
+    let Ok(protocol_points) = ctx.store.alarm_protocol_points_for_meter(meter.record.id) else {
+        return;
+    };
+    if protocol_points.is_empty() {
+        return;
+    }
+    for rule in protocol_points {
+        let event_id = format!(
+            "ALARM_PROTOCOL:{}:{}:{}",
+            rule.protocol_id,
+            meter.record.device_sn,
+            rule.point_code.to_lowercase()
+        );
+        let value = points
+            .iter()
+            .find(|(code, _)| code.eq_ignore_ascii_case(&rule.point_code))
+            .map(|(_, value)| *value);
+        let Some(value) = value.filter(|value| value.is_finite()) else {
+            continue;
+        };
+        if protocol_point_triggered(&rule, value) {
+            let threshold = protocol_threshold_text(&rule);
+            let message = format!(
+                "{} {}={} 触发告警条件 {}",
+                meter.record.device_sn, rule.point_name, value, threshold
+            );
+            raise_protocol_alarm(ctx, meter, &event_id, &rule, value, message);
+        } else if protocol_point_recovered(&rule, value) {
+            recover_protocol_alarm(ctx, meter, &event_id, &rule, value);
+        }
+    }
+}
+
+fn protocol_point_triggered(rule: &AlarmProtocolPointRecord, value: f64) -> bool {
+    match rule.operator.trim().to_ascii_lowercase().as_str() {
+        ">" | "gt" => rule.threshold_value.is_some_and(|limit| value > limit),
+        ">=" | "gte" => rule.threshold_value.is_some_and(|limit| value >= limit),
+        "<" | "lt" => rule.threshold_value.is_some_and(|limit| value < limit),
+        "<=" | "lte" => rule.threshold_value.is_some_and(|limit| value <= limit),
+        "=" | "==" | "eq" => rule
+            .threshold_value
+            .is_some_and(|limit| (value - limit).abs() < f64::EPSILON),
+        "between" => rule
+            .threshold_min
+            .zip(rule.threshold_max)
+            .is_some_and(|(min, max)| value >= min && value <= max),
+        _ => false,
+    }
+}
+
+fn protocol_point_recovered(rule: &AlarmProtocolPointRecord, value: f64) -> bool {
+    if let Some(recovery) = rule.recovery_threshold_value {
+        return match rule.operator.trim().to_ascii_lowercase().as_str() {
+            ">" | ">=" | "gt" | "gte" => value <= recovery,
+            "<" | "<=" | "lt" | "lte" => value >= recovery,
+            _ => !protocol_point_triggered(rule, value),
+        };
+    }
+    !protocol_point_triggered(rule, value)
+}
+
+fn protocol_threshold_text(rule: &AlarmProtocolPointRecord) -> String {
+    if rule.operator.eq_ignore_ascii_case("between") {
+        return format!(
+            "between {} and {}",
+            rule.threshold_min.unwrap_or_default(),
+            rule.threshold_max.unwrap_or_default()
+        );
+    }
+    format!(
+        "{} {}",
+        rule.operator,
+        rule.threshold_value.unwrap_or_default()
+    )
+}
+
+fn protocol_threshold_value(rule: &AlarmProtocolPointRecord) -> Option<f64> {
+    if rule.operator.eq_ignore_ascii_case("between") {
+        return rule.threshold_max;
+    }
+    rule.threshold_value
+}
+
+fn raise_protocol_alarm(
+    ctx: &TaskCtx,
+    meter: &MeterRuntime,
+    event_id: &str,
+    rule: &AlarmProtocolPointRecord,
+    value: f64,
+    message: String,
+) {
+    let now = ctx.now_ms();
+    let row = gw_store::AlarmEventRecord {
+        source_event_id: event_id.to_string(),
+        source: "GATEWAY".into(),
+        meter_id: Some(meter.record.id),
+        alarm_type: rule.alarm_type.clone(),
+        level: rule.level.clone(),
+        point_code: Some(rule.point_code.clone()),
+        message: message.clone(),
+        status: "ACTIVE".into(),
+        first_seen_ms: now,
+        last_seen_ms: now,
+        cloud_status: "LOCAL".into(),
+        cloud_message_id: None,
+        cloud_ack_ms: None,
+    };
+    if matches!(ctx.store.upsert_alarm(&row), Ok(true)) {
+        enqueue_gateway_alarm_with_context(
+            ctx,
+            meter,
+            &row,
+            "RAISED",
+            format!("{message}，当前值 {value}"),
+            Some(value),
+            protocol_threshold_value(rule),
+            Some(rule.point_name.clone()),
+            Some(rule.operator.clone()),
+        );
+    }
+}
+
+fn recover_protocol_alarm(
+    ctx: &TaskCtx,
+    meter: &MeterRuntime,
+    event_id: &str,
+    rule: &AlarmProtocolPointRecord,
+    value: f64,
+) {
+    if matches!(
+        ctx.store.resolve_alarm("GATEWAY", event_id, ctx.now_ms()),
+        Ok(true)
+    ) {
+        let message = format!(
+            "{} {} 已恢复，当前值 {}",
+            meter.record.device_sn, rule.point_name, value
+        );
+        let row = gw_store::AlarmEventRecord {
+            source_event_id: event_id.to_string(),
+            source: "GATEWAY".into(),
+            meter_id: Some(meter.record.id),
+            alarm_type: rule.alarm_type.clone(),
+            level: "INFO".into(),
+            point_code: Some(rule.point_code.clone()),
+            message: message.clone(),
+            status: "RECOVERED".into(),
+            first_seen_ms: ctx.now_ms(),
+            last_seen_ms: ctx.now_ms(),
+            cloud_status: "LOCAL".into(),
+            cloud_message_id: None,
+            cloud_ack_ms: None,
+        };
+        enqueue_gateway_alarm_with_context(
+            ctx,
+            meter,
+            &row,
+            "RECOVERED",
+            message,
+            Some(value),
+            protocol_threshold_value(rule),
+            Some(rule.point_name.clone()),
+            Some(rule.operator.clone()),
+        );
+    }
 }
 
 /// 周期性把所有尚未归批的中间样本装入一条 DATA_UPLOAD。SQLite 事务保证样本与 outbox 不会脱节。
@@ -924,6 +1093,20 @@ fn enqueue_gateway_alarm(
     action: &str,
     message: String,
 ) {
+    enqueue_gateway_alarm_with_context(ctx, meter, alarm, action, message, None, None, None, None);
+}
+
+fn enqueue_gateway_alarm_with_context(
+    ctx: &TaskCtx,
+    meter: &MeterRuntime,
+    alarm: &gw_store::AlarmEventRecord,
+    action: &str,
+    message: String,
+    alarm_value: Option<f64>,
+    threshold_value: Option<f64>,
+    point_name: Option<String>,
+    compare_operator: Option<String>,
+) {
     let timestamp = ctx.state.next_message_ts(ctx.now_ms());
     let gateway_id = ctx.state.gateway_id();
     let message_id = proto::ids::alarm_message_id(&gateway_id, timestamp);
@@ -939,6 +1122,10 @@ fn enqueue_gateway_alarm(
         level: alarm.level.clone(),
         device_sn: Some(meter.record.device_sn.clone()),
         point_code: alarm.point_code.clone(),
+        point_name,
+        alarm_value,
+        threshold_value,
+        compare_operator,
         message,
     };
     let Ok(payload) = serde_json::to_vec(&payload) else {
@@ -1629,6 +1816,7 @@ async fn snapshotter_task(
 async fn maintainer_task(
     store: Arc<Store>,
     clock: Arc<dyn ClockSource>,
+    tz_offset_s: i32,
     shutdown: CancellationToken,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(3600));
@@ -1637,6 +1825,26 @@ async fn maintainer_task(
         tokio::select! {
             _ = shutdown.cancelled() => return,
             _ = ticker.tick() => {}
+        }
+        if let Some((week_start, week_end)) = weekly_archive_window(clock.now_ms(), tz_offset_s) {
+            let last_archived = store
+                .get_config("weekly_archive_last_start_ms")
+                .ok()
+                .flatten()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            if last_archived < week_start {
+                match store.archive_weekly_samples(week_start, week_end, clock.now_ms()) {
+                    Ok((summary_count, deleted)) => {
+                        let _ = store
+                            .set_config("weekly_archive_last_start_ms", &week_start.to_string());
+                        tracing::info!(
+                            "周汇总完成: {summary_count} 台设备，删除 {deleted} 条上一周明细"
+                        );
+                    }
+                    Err(e) => tracing::warn!("周汇总失败: {e}"),
+                }
+            }
         }
         let cutoff = clock.now_ms().saturating_sub(7 * 24 * 3600 * 1000);
         if let Err(e) = store.cleanup_samples_before(cutoff) {
@@ -1654,6 +1862,25 @@ async fn maintainer_task(
             tracing::warn!("事件裁剪失败: {e}");
         }
     }
+}
+
+fn weekly_archive_window(now_ms: u64, tz_offset_s: i32) -> Option<(u64, u64)> {
+    const DAY_MS: i64 = 86_400_000;
+    const WEEK_MS: i64 = 7 * DAY_MS;
+    let local_ms = now_ms as i64 + tz_offset_s as i64 * 1000;
+    let local_day = local_ms.div_euclid(DAY_MS);
+    let ms_of_day = local_ms.rem_euclid(DAY_MS);
+    let weekday_monday0 = (local_day + 3).rem_euclid(7);
+    if weekday_monday0 != 0 || ms_of_day < 2 * 3_600_000 {
+        return None;
+    }
+    let current_week_start_local_ms = (local_day * DAY_MS) - weekday_monday0 * DAY_MS;
+    let previous_week_start_local_ms = current_week_start_local_ms - WEEK_MS;
+    let offset_ms = tz_offset_s as i64 * 1000;
+    Some((
+        (previous_week_start_local_ms - offset_ms) as u64,
+        (current_week_start_local_ms - offset_ms) as u64,
+    ))
 }
 
 /// re-export 供 bins 组装。

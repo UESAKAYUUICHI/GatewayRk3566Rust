@@ -71,9 +71,9 @@ async fn main() -> anyhow::Result<()> {
         {
             channel.port = bootstrap.serial.port.clone();
             channel.baud = bootstrap.serial.baud;
-                channel.data_bits = bootstrap.serial.data_bits;
-                channel.stop_bits = bootstrap.serial.stop_bits;
-                channel.parity = bootstrap.serial.parity.clone();
+            channel.data_bits = bootstrap.serial.data_bits;
+            channel.stop_bits = bootstrap.serial.stop_bits;
+            channel.parity = bootstrap.serial.parity.clone();
             store.upsert_channel(&channel, 0)?;
         }
         store.set_config("rs485_initialized", "1")?;
@@ -168,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
         loop {
             let interval_s = rule_sync_state
                 .store
-                .get_config("alarm_rule_sync_interval_s")
+                .get_config("alarm_protocol_sync_interval_s")
                 .ok()
                 .flatten()
                 .and_then(|value| value.parse::<u64>().ok())
@@ -177,8 +177,8 @@ async fn main() -> anyhow::Result<()> {
             tokio::select! {
                 _ = rule_sync_shutdown.cancelled() => return,
                 _ = tokio::time::sleep(std::time::Duration::from_secs(interval_s)) => {
-                    if let Err(error) = gw_web::sync_platform_alarm_rules_once(&rule_sync_state).await {
-                        tracing::debug!("平台告警规则同步暂未完成: {error:?}");
+                    if let Err(error) = gw_web::sync_platform_alarm_protocols_once(&rule_sync_state).await {
+                        tracing::debug!("平台告警协议同步暂未完成: {error:?}");
                     }
                 }
             }

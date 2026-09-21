@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -18,6 +19,86 @@ pub enum StoreError {
 pub type StoreResult<T> = Result<T, StoreError>;
 
 const STAGING_CHANNEL_ID: &str = "__staging__";
+
+#[derive(Debug)]
+struct WeeklyAccumulator {
+    meter_id: i64,
+    sample_count: u64,
+    normal_count: u64,
+    first_read_ms: u64,
+    last_read_ms: u64,
+    first_energy_kwh: Option<f64>,
+    last_energy_kwh: Option<f64>,
+    power_sum_kw: f64,
+    power_count: u64,
+    min_voltage_v: Option<f64>,
+    max_voltage_v: Option<f64>,
+}
+
+impl WeeklyAccumulator {
+    fn new(meter_id: i64) -> Self {
+        Self {
+            meter_id,
+            sample_count: 0,
+            normal_count: 0,
+            first_read_ms: 0,
+            last_read_ms: 0,
+            first_energy_kwh: None,
+            last_energy_kwh: None,
+            power_sum_kw: 0.0,
+            power_count: 0,
+            min_voltage_v: None,
+            max_voltage_v: None,
+        }
+    }
+
+    fn push(&mut self, read_ms: u64, quality: u32, points_json: &str) {
+        self.sample_count += 1;
+        if quality == 0 {
+            self.normal_count += 1;
+        }
+        if self.first_read_ms == 0 || read_ms < self.first_read_ms {
+            self.first_read_ms = read_ms;
+        }
+        self.last_read_ms = self.last_read_ms.max(read_ms);
+
+        if let Some(energy) = point_value(points_json, "forward_active_energy") {
+            if self.first_energy_kwh.is_none() {
+                self.first_energy_kwh = Some(energy);
+            }
+            self.last_energy_kwh = Some(energy);
+        }
+        if let Some(power) = point_value(points_json, "active_power_total") {
+            self.power_sum_kw += power;
+            self.power_count += 1;
+        }
+        for code in ["voltage_a", "voltage_b", "voltage_c"] {
+            if let Some(voltage) = point_value(points_json, code) {
+                self.min_voltage_v = Some(self.min_voltage_v.map_or(voltage, |v| v.min(voltage)));
+                self.max_voltage_v = Some(self.max_voltage_v.map_or(voltage, |v| v.max(voltage)));
+            }
+        }
+    }
+
+    fn delta_kwh(&self) -> f64 {
+        match (self.first_energy_kwh, self.last_energy_kwh) {
+            (Some(first), Some(last)) if last >= first => last - first,
+            _ => 0.0,
+        }
+    }
+
+    fn avg_power_kw(&self) -> Option<f64> {
+        (self.power_count > 0).then_some(self.power_sum_kw / self.power_count as f64)
+    }
+}
+
+fn point_value(points_json: &str, point_code: &str) -> Option<f64> {
+    let points = serde_json::from_str::<Vec<(String, f64)>>(points_json).ok()?;
+    points
+        .into_iter()
+        .find(|(code, _)| code.eq_ignore_ascii_case(point_code))
+        .map(|(_, value)| value)
+}
 
 const MIGRATIONS: &[&str] = &[
     // v1：初始结构
@@ -246,6 +327,64 @@ const MIGRATIONS: &[&str] = &[
         parameter_json   TEXT,
         PRIMARY KEY(profile, command_code)
     );
+    ",
+    // v13: weekly sample summary keeps chart-friendly history after raw sample retention.
+    "
+    CREATE TABLE IF NOT EXISTS meter_weekly_summary (
+        meter_id          INTEGER NOT NULL REFERENCES meter(id) ON DELETE CASCADE,
+        week_start_ms     INTEGER NOT NULL,
+        week_end_ms       INTEGER NOT NULL,
+        sample_count      INTEGER NOT NULL DEFAULT 0,
+        normal_count      INTEGER NOT NULL DEFAULT 0,
+        first_read_ms     INTEGER NOT NULL DEFAULT 0,
+        last_read_ms      INTEGER NOT NULL DEFAULT 0,
+        first_energy_kwh  REAL,
+        last_energy_kwh   REAL,
+        delta_kwh         REAL NOT NULL DEFAULT 0,
+        avg_power_kw      REAL,
+        min_voltage_v     REAL,
+        max_voltage_v     REAL,
+        created_ms        INTEGER NOT NULL,
+        PRIMARY KEY(meter_id, week_start_ms)
+    );
+    CREATE INDEX IF NOT EXISTS idx_weekly_summary_time
+      ON meter_weekly_summary(week_start_ms, meter_id);
+    INSERT OR IGNORE INTO gateway_config(key,value) VALUES('sample_retention_days','7');
+    INSERT OR IGNORE INTO gateway_config(key,value) VALUES('weekly_archive_last_start_ms','0');
+    ",
+    // v14: platform alarm protocols and per-device bindings.
+    "
+    CREATE TABLE IF NOT EXISTS alarm_protocol (
+        protocol_id   INTEGER PRIMARY KEY,
+        protocol_key  TEXT NOT NULL UNIQUE,
+        protocol_name TEXT NOT NULL,
+        version_no    INTEGER NOT NULL DEFAULT 1,
+        enabled       INTEGER NOT NULL DEFAULT 1,
+        updated_ms    INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS alarm_protocol_point (
+        point_id       INTEGER PRIMARY KEY,
+        protocol_id    INTEGER NOT NULL REFERENCES alarm_protocol(protocol_id) ON DELETE CASCADE,
+        point_code     TEXT NOT NULL,
+        point_name     TEXT NOT NULL,
+        alarm_type     TEXT NOT NULL,
+        level          TEXT NOT NULL,
+        operator       TEXT NOT NULL,
+        threshold_value REAL,
+        threshold_min   REAL,
+        threshold_max   REAL,
+        recovery_threshold_value REAL,
+        duration_s     INTEGER NOT NULL DEFAULT 0,
+        enabled        INTEGER NOT NULL DEFAULT 1,
+        UNIQUE(protocol_id, point_code)
+    );
+    CREATE TABLE IF NOT EXISTS alarm_protocol_binding (
+        protocol_id INTEGER NOT NULL REFERENCES alarm_protocol(protocol_id) ON DELETE CASCADE,
+        device_sn   TEXT NOT NULL,
+        enabled     INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY(protocol_id, device_sn)
+    );
+    INSERT OR IGNORE INTO gateway_config(key,value) VALUES('alarm_protocol_sync_interval_s','300');
     ",
 ];
 
@@ -658,6 +797,157 @@ impl Store {
         Ok(())
     }
 
+    pub fn replace_platform_alarm_protocols(
+        &self,
+        protocols: &[AlarmProtocolRecord],
+        now_ms: u64,
+    ) -> StoreResult<()> {
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM alarm_protocol_binding", [])?;
+        tx.execute("DELETE FROM alarm_protocol_point", [])?;
+        tx.execute("DELETE FROM alarm_protocol", [])?;
+        for protocol in protocols {
+            tx.execute(
+                "INSERT INTO alarm_protocol(protocol_id,protocol_key,protocol_name,version_no,enabled,updated_ms)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    protocol.protocol_id,
+                    protocol.protocol_key,
+                    protocol.protocol_name,
+                    protocol.version_no,
+                    protocol.enabled as i64,
+                    now_ms as i64
+                ],
+            )?;
+            for point in &protocol.points {
+                tx.execute(
+                    "INSERT INTO alarm_protocol_point
+                       (point_id,protocol_id,point_code,point_name,alarm_type,level,operator,
+                        threshold_value,threshold_min,threshold_max,recovery_threshold_value,duration_s,enabled)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                    params![
+                        point.point_id,
+                        protocol.protocol_id,
+                        point.point_code,
+                        point.point_name,
+                        point.alarm_type,
+                        point.level,
+                        point.operator,
+                        point.threshold_value,
+                        point.threshold_min,
+                        point.threshold_max,
+                        point.recovery_threshold_value,
+                        point.duration_s as i64,
+                        point.enabled as i64
+                    ],
+                )?;
+            }
+            for device in &protocol.devices {
+                tx.execute(
+                    "INSERT INTO alarm_protocol_binding(protocol_id,device_sn,enabled) VALUES(?1,?2,1)",
+                    params![protocol.protocol_id, device.device_sn],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn alarm_protocol_points_for_meter(
+        &self,
+        meter_id: i64,
+    ) -> StoreResult<Vec<AlarmProtocolPointRecord>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT pp.point_id,pp.protocol_id,pp.point_code,pp.point_name,pp.alarm_type,pp.level,
+                    pp.operator,pp.threshold_value,pp.threshold_min,pp.threshold_max,
+                    pp.recovery_threshold_value,pp.duration_s,pp.enabled
+             FROM meter m
+             JOIN alarm_protocol_binding b ON b.device_sn=m.device_sn AND b.enabled=1
+             JOIN alarm_protocol p ON p.protocol_id=b.protocol_id AND p.enabled=1
+             JOIN alarm_protocol_point pp ON pp.protocol_id=p.protocol_id AND pp.enabled=1
+             WHERE m.id=?1
+             ORDER BY pp.protocol_id,pp.point_id",
+        )?;
+        Ok(stmt
+            .query_map(params![meter_id], |row| {
+                Ok(AlarmProtocolPointRecord {
+                    point_id: row.get(0)?,
+                    protocol_id: row.get(1)?,
+                    point_code: row.get(2)?,
+                    point_name: row.get(3)?,
+                    alarm_type: row.get(4)?,
+                    level: row.get(5)?,
+                    operator: row.get(6)?,
+                    threshold_value: row.get(7)?,
+                    threshold_min: row.get(8)?,
+                    threshold_max: row.get(9)?,
+                    recovery_threshold_value: row.get(10)?,
+                    duration_s: row.get::<_, i64>(11)? as u64,
+                    enabled: row.get::<_, i64>(12)? == 1,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn alarm_protocols(&self) -> StoreResult<Vec<AlarmProtocolRecord>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT protocol_id,protocol_key,protocol_name,version_no,enabled,updated_ms
+             FROM alarm_protocol ORDER BY protocol_id",
+        )?;
+        let mut result = Vec::new();
+        for row in stmt.query_map([], |row| {
+            Ok(AlarmProtocolRecord {
+                protocol_id: row.get(0)?,
+                protocol_key: row.get(1)?,
+                protocol_name: row.get(2)?,
+                version_no: row.get(3)?,
+                enabled: row.get::<_, i64>(4)? == 1,
+                updated_ms: row.get::<_, i64>(5)? as u64,
+                devices: Vec::new(),
+                points: Vec::new(),
+            })
+        })? {
+            let mut protocol = row?;
+            let mut device_stmt = conn.prepare(
+                "SELECT device_sn FROM alarm_protocol_binding WHERE protocol_id=?1 AND enabled=1",
+            )?;
+            protocol.devices = device_stmt
+                .query_map(params![protocol.protocol_id], |item| {
+                    Ok(AlarmProtocolDeviceRecord { device_sn: item.get(0)? })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut point_stmt = conn.prepare(
+                "SELECT point_id,protocol_id,point_code,point_name,alarm_type,level,operator,
+                        threshold_value,threshold_min,threshold_max,recovery_threshold_value,duration_s,enabled
+                 FROM alarm_protocol_point WHERE protocol_id=?1 ORDER BY point_id",
+            )?;
+            protocol.points = point_stmt
+                .query_map(params![protocol.protocol_id], |item| {
+                    Ok(AlarmProtocolPointRecord {
+                        point_id: item.get(0)?,
+                        protocol_id: item.get(1)?,
+                        point_code: item.get(2)?,
+                        point_name: item.get(3)?,
+                        alarm_type: item.get(4)?,
+                        level: item.get(5)?,
+                        operator: item.get(6)?,
+                        threshold_value: item.get(7)?,
+                        threshold_min: item.get(8)?,
+                        threshold_max: item.get(9)?,
+                        recovery_threshold_value: item.get(10)?,
+                        duration_s: item.get::<_, i64>(11)? as u64,
+                        enabled: item.get::<_, i64>(12)? == 1,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            result.push(protocol);
+        }
+        Ok(result)
+    }
+
     /// 原子应用平台下发配置。LOCAL 设备不会被同步删除；新平台设备先进入暂存区。
     pub fn apply_platform_sync(
         &self,
@@ -676,7 +966,9 @@ impl Store {
             let protocol = channel.protocol.trim().to_ascii_uppercase();
             let port = channel.serial_port.trim();
             if id.is_empty() || port.is_empty() {
-                return Err(StoreError::Validation("platform channel id and serial port are required".into()));
+                return Err(StoreError::Validation(
+                    "platform channel id and serial port are required".into(),
+                ));
             }
             if protocol != "MODBUS_RTU" {
                 return Err(StoreError::Validation(format!(
@@ -765,7 +1057,10 @@ impl Store {
                 "DELETE FROM meter_register_map WHERE profile=?1",
                 params![model.profile],
             )?;
-            tx.execute("DELETE FROM protocol_command WHERE profile=?1", params![model.profile])?;
+            tx.execute(
+                "DELETE FROM protocol_command WHERE profile=?1",
+                params![model.profile],
+            )?;
             for row in &model.points {
                 tx.execute(
                     "INSERT INTO meter_register_map(profile,point_code,point_name,unit,func,address,quantity,field_offset,field_quantity,bit_offset,bit_length,data_type,byte_order,scale,offset)
@@ -830,7 +1125,8 @@ impl Store {
             .map(|device| device.device_sn.as_str())
             .collect::<std::collections::HashSet<_>>();
         let platform_devices = {
-            let mut stmt = tx.prepare("SELECT device_sn FROM meter WHERE config_source='PLATFORM'")?;
+            let mut stmt =
+                tx.prepare("SELECT device_sn FROM meter WHERE config_source='PLATFORM'")?;
             stmt.query_map([], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?
         };
@@ -840,7 +1136,8 @@ impl Store {
             }
         }
         let platform_channels = {
-            let mut stmt = tx.prepare("SELECT id FROM rs485_channel WHERE config_source='PLATFORM'")?;
+            let mut stmt =
+                tx.prepare("SELECT id FROM rs485_channel WHERE config_source='PLATFORM'")?;
             stmt.query_map([], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?
         };
@@ -1570,6 +1867,137 @@ impl Store {
         )?)
     }
 
+    /// 将一个完整周区间的样本压缩成每表一行汇总，随后删除已上报或本地未上报样本。
+    ///
+    /// pending/deferred outbox 关联的样本不会被删除，避免断网期间数据丢失。
+    pub fn archive_weekly_samples(
+        &self,
+        week_start_ms: u64,
+        week_end_ms: u64,
+        created_ms: u64,
+    ) -> StoreResult<(usize, usize)> {
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+        let mut summaries: HashMap<i64, WeeklyAccumulator> = HashMap::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT meter_id, read_ms, quality, points_json
+                 FROM meter_sample
+                 WHERE read_ms>=?1 AND read_ms<?2
+                 ORDER BY meter_id, read_ms, id",
+            )?;
+            let mut rows = stmt.query(params![week_start_ms as i64, week_end_ms as i64])?;
+            while let Some(row) = rows.next()? {
+                let meter_id = row.get::<_, i64>(0)?;
+                let read_ms = row.get::<_, i64>(1)? as u64;
+                let quality = row.get::<_, i64>(2)? as u32;
+                let points_json = row.get::<_, String>(3)?;
+                summaries
+                    .entry(meter_id)
+                    .or_insert_with(|| WeeklyAccumulator::new(meter_id))
+                    .push(read_ms, quality, &points_json);
+            }
+        }
+        let mut summary_count = 0usize;
+        for summary in summaries
+            .values()
+            .filter(|summary| summary.sample_count > 0)
+        {
+            tx.execute(
+                "INSERT INTO meter_weekly_summary(
+                    meter_id,week_start_ms,week_end_ms,sample_count,normal_count,
+                    first_read_ms,last_read_ms,first_energy_kwh,last_energy_kwh,
+                    delta_kwh,avg_power_kw,min_voltage_v,max_voltage_v,created_ms)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+                 ON CONFLICT(meter_id, week_start_ms) DO UPDATE SET
+                    week_end_ms=excluded.week_end_ms,
+                    sample_count=excluded.sample_count,
+                    normal_count=excluded.normal_count,
+                    first_read_ms=excluded.first_read_ms,
+                    last_read_ms=excluded.last_read_ms,
+                    first_energy_kwh=excluded.first_energy_kwh,
+                    last_energy_kwh=excluded.last_energy_kwh,
+                    delta_kwh=excluded.delta_kwh,
+                    avg_power_kw=excluded.avg_power_kw,
+                    min_voltage_v=excluded.min_voltage_v,
+                    max_voltage_v=excluded.max_voltage_v,
+                    created_ms=excluded.created_ms",
+                params![
+                    summary.meter_id,
+                    week_start_ms as i64,
+                    week_end_ms as i64,
+                    summary.sample_count as i64,
+                    summary.normal_count as i64,
+                    summary.first_read_ms as i64,
+                    summary.last_read_ms as i64,
+                    summary.first_energy_kwh,
+                    summary.last_energy_kwh,
+                    summary.delta_kwh(),
+                    summary.avg_power_kw(),
+                    summary.min_voltage_v,
+                    summary.max_voltage_v,
+                    created_ms as i64,
+                ],
+            )?;
+            summary_count += 1;
+        }
+        let deleted = tx.execute(
+            "DELETE FROM meter_sample
+             WHERE read_ms>=?1 AND read_ms<?2
+               AND (
+                    outbox_id IN (SELECT id FROM outbox_message WHERE status='sent')
+                    OR (
+                        outbox_id IS NULL
+                        AND meter_id IN (SELECT id FROM meter WHERE upload_enabled=0)
+                    )
+               )",
+            params![week_start_ms as i64, week_end_ms as i64],
+        )?;
+        tx.commit()?;
+        Ok((summary_count, deleted))
+    }
+
+    pub fn weekly_summaries_since(
+        &self,
+        from_ms: u64,
+        limit: u32,
+    ) -> StoreResult<Vec<MeterWeeklySummary>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT s.meter_id,m.device_sn,m.device_name,s.week_start_ms,s.week_end_ms,
+                    s.sample_count,s.normal_count,s.first_read_ms,s.last_read_ms,
+                    s.first_energy_kwh,s.last_energy_kwh,s.delta_kwh,s.avg_power_kw,
+                    s.min_voltage_v,s.max_voltage_v
+             FROM meter_weekly_summary s
+             JOIN meter m ON m.id=s.meter_id
+             WHERE s.week_start_ms>=?1
+             ORDER BY s.week_start_ms,s.meter_id
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![from_ms as i64, limit], |r| {
+                Ok(MeterWeeklySummary {
+                    meter_id: r.get(0)?,
+                    device_sn: r.get(1)?,
+                    device_name: r.get(2)?,
+                    week_start_ms: r.get::<_, i64>(3)? as u64,
+                    week_end_ms: r.get::<_, i64>(4)? as u64,
+                    sample_count: r.get::<_, i64>(5)? as u64,
+                    normal_count: r.get::<_, i64>(6)? as u64,
+                    first_read_ms: r.get::<_, i64>(7)? as u64,
+                    last_read_ms: r.get::<_, i64>(8)? as u64,
+                    first_energy_kwh: r.get(9)?,
+                    last_energy_kwh: r.get(10)?,
+                    delta_kwh: r.get(11)?,
+                    avg_power_kw: r.get(12)?,
+                    min_voltage_v: r.get(13)?,
+                    max_voltage_v: r.get(14)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn reading(&self, meter_id: i64) -> StoreResult<Option<ReadingRecord>> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let record = conn
@@ -1772,7 +2200,9 @@ fn normalize_parity(value: &str) -> StoreResult<String> {
         "N" | "NONE" => Ok("NONE".to_string()),
         "E" | "EVEN" => Ok("EVEN".to_string()),
         "O" | "ODD" => Ok("ODD".to_string()),
-        other => Err(StoreError::Validation(format!("unsupported parity {other}"))),
+        other => Err(StoreError::Validation(format!(
+            "unsupported parity {other}"
+        ))),
     }
 }
 
@@ -1874,7 +2304,11 @@ mod tests {
         let store = test_store("platform-channel-invalid");
         let mut tcp = synced_channel("tcp-1", "127.0.0.1:502");
         tcp.protocol = "MODBUS_TCP".to_string();
-        assert!(store.apply_platform_sync("rev-1", &[tcp], &[], &[], 10).is_err());
+        assert!(
+            store
+                .apply_platform_sync("rev-1", &[tcp], &[], &[], 10)
+                .is_err()
+        );
 
         assert!(
             store

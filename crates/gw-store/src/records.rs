@@ -145,6 +145,40 @@ pub struct AlarmRuleRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct AlarmProtocolRecord {
+    pub protocol_id: i64,
+    pub protocol_key: String,
+    pub protocol_name: String,
+    pub version_no: i64,
+    pub enabled: bool,
+    pub updated_ms: u64,
+    pub devices: Vec<AlarmProtocolDeviceRecord>,
+    pub points: Vec<AlarmProtocolPointRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlarmProtocolDeviceRecord {
+    pub device_sn: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlarmProtocolPointRecord {
+    pub point_id: i64,
+    pub protocol_id: i64,
+    pub point_code: String,
+    pub point_name: String,
+    pub alarm_type: String,
+    pub level: String,
+    pub operator: String,
+    pub threshold_value: Option<f64>,
+    pub threshold_min: Option<f64>,
+    pub threshold_max: Option<f64>,
+    pub recovery_threshold_value: Option<f64>,
+    pub duration_s: u64,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct SyncedThingModel {
     pub profile: String,
     pub name: String,
@@ -191,6 +225,25 @@ pub struct ThingModelSummary {
     pub source: String,
     pub point_count: u32,
     pub device_count: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct MeterWeeklySummary {
+    pub meter_id: i64,
+    pub device_sn: String,
+    pub device_name: String,
+    pub week_start_ms: u64,
+    pub week_end_ms: u64,
+    pub sample_count: u64,
+    pub normal_count: u64,
+    pub first_read_ms: u64,
+    pub last_read_ms: u64,
+    pub first_energy_kwh: Option<f64>,
+    pub last_energy_kwh: Option<f64>,
+    pub delta_kwh: f64,
+    pub avg_power_kw: Option<f64>,
+    pub min_voltage_v: Option<f64>,
+    pub max_voltage_v: Option<f64>,
 }
 
 /// 待入 outbox 的报文。

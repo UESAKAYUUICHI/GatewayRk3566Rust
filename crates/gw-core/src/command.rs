@@ -15,7 +15,10 @@ pub enum GatewayAction {
     /// 重启网关（回执后延迟执行）
     Reboot,
     /// Execute a command from the synchronized protocol whitelist.
-    DeviceCommand { target_sn: String, command_code: String },
+    DeviceCommand {
+        target_sn: String,
+        command_code: String,
+    },
     /// 未知指令类型：回执 FAILED
     Unknown { kind: String },
 }
@@ -51,7 +54,9 @@ pub fn interpret(body: &CommandBody) -> GatewayAction {
         Some("REBOOT_GATEWAY") => GatewayAction::Reboot,
         Some("DEVICE_COMMAND") | Some("EXECUTE_DEVICE_COMMAND") => GatewayAction::DeviceCommand {
             target_sn: body.target_sn.clone().unwrap_or_default(),
-            command_code: body.payload.get("commandCode")
+            command_code: body
+                .payload
+                .get("commandCode")
                 .or_else(|| body.payload.get("command_code"))
                 .and_then(|value| value.as_str())
                 .unwrap_or_default()
