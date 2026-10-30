@@ -31,6 +31,18 @@ use crate::config::BootstrapConfig;
 use crate::state::{AppState, MeterRuntime, PollerRegistry, SharedState};
 use crate::transport_registry::TransportRegistry;
 
+const DEVICE_PROBE_INTERVAL_S: u64 = 20;
+const DEVICE_OFFLINE_FAILURE_THRESHOLD: u32 = 3;
+const STALE_SAMPLE_GRACE_MULTIPLIER: u64 = 2;
+
+fn effective_collect_interval_s(continuous_pull: bool) -> u64 {
+    if continuous_pull {
+        5
+    } else {
+        DEVICE_PROBE_INTERVAL_S
+    }
+}
+
 /// 时钟源端口。
 pub trait ClockSource: Send + Sync {
     fn now_ms(&self) -> u64;
@@ -450,29 +462,46 @@ async fn poll_once<T: MeterTransport + ?Sized>(
     Ok(points)
 }
 
-/// 单表采集任务。周期每轮从状态重读（SET_INTERVAL 即时生效）；
+/// 单表采集任务。
+///
+/// 每台设备都有独立的探测状态：
+/// - 任务启动后立即尝试一次；
+/// - 尚未成功读到数据时，每 20 秒重试；
+/// - 首次成功后按设备采集周期运行；
+/// - 已上线设备再次读失败时，也按 20 秒重试，成功后恢复正常周期。
+///
 /// 表删除/停用由 sync_pollers 取消令牌，本任务自然退出。
 async fn poller_task(ctx: TaskCtx, meter_id: i64, shutdown: CancellationToken) {
     let token = ctx.registry.token_for(meter_id);
+    let mut first_attempt = true;
+    let mut consecutive_link_failures = 0_u32;
     loop {
         let configured_interval_s = ctx
             .state
             .meter_by_id(meter_id)
             .map(|m| m.record.collect_interval_s)
             .unwrap_or(0);
-        let interval_s = if ctx.state.continuous_pull_enabled(meter_id) {
-            5
-        } else {
-            configured_interval_s
-        };
-        if interval_s == 0 {
+        if configured_interval_s == 0 {
             return; // 表已删除或停用
         }
-        tokio::select! {
-            _ = shutdown.cancelled() => return,
-            _ = token.cancelled() => return,
-            _ = tokio::time::sleep(Duration::from_secs(interval_s.max(1))) => {}
+        let interval_s = effective_collect_interval_s(ctx.state.continuous_pull_enabled(meter_id));
+        let wait_s = if first_attempt || consecutive_link_failures > 0 {
+            if first_attempt {
+                0
+            } else {
+                DEVICE_PROBE_INTERVAL_S
+            }
+        } else {
+            interval_s.max(1)
+        };
+        if wait_s > 0 {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = token.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_secs(wait_s)) => {}
+            }
         }
+        first_attempt = false;
         let Some(meter) = ctx.state.meter_by_id(meter_id) else {
             return;
         };
@@ -490,6 +519,7 @@ async fn poller_task(ctx: TaskCtx, meter_id: i64, shutdown: CancellationToken) {
                 "MAJOR",
                 format!("RS485 通道 {} 未启用或不存在", meter.record.channel_id),
             );
+            consecutive_link_failures = consecutive_link_failures.saturating_add(1);
             continue;
         }
         recover_gateway_alarm(
@@ -517,6 +547,7 @@ async fn poller_task(ctx: TaskCtx, meter_id: i64, shutdown: CancellationToken) {
         let specs = specs_of(&rows);
         let Some(transport) = ensure_channel_transport(&ctx, &meter).await else {
             handle_channel_unavailable(&ctx, &meter);
+            consecutive_link_failures = consecutive_link_failures.saturating_add(1);
             continue;
         };
         recover_gateway_alarm(
@@ -527,8 +558,33 @@ async fn poller_task(ctx: TaskCtx, meter_id: i64, shutdown: CancellationToken) {
             format!("RS485 通道 {} 传输已恢复", meter.record.channel_id),
         );
         match poll_once(&transport, &meter.record, &specs).await {
-            Ok(points) => handle_sample(&ctx, &meter, points).await,
-            Err(e) => handle_poll_failure(&ctx, &meter, e),
+            Ok(points) => {
+                if consecutive_link_failures > 0 {
+                    ctx.emitter.emit(
+                        "INFO",
+                        "poller",
+                        format!("{} 已恢复采集，恢复正常采集周期", meter.record.device_sn),
+                    );
+                }
+                consecutive_link_failures = 0;
+                handle_sample(&ctx, &meter, points).await;
+            }
+            Err(e) => {
+                consecutive_link_failures = consecutive_link_failures.saturating_add(1);
+                if consecutive_link_failures == DEVICE_OFFLINE_FAILURE_THRESHOLD {
+                    ctx.emitter.emit(
+                        "WARN",
+                        "poller",
+                        format!(
+                            "{} 连续 {} 次未采集到数据，后续每 {} 秒探测一次",
+                            meter.record.device_sn,
+                            DEVICE_OFFLINE_FAILURE_THRESHOLD,
+                            DEVICE_PROBE_INTERVAL_S
+                        ),
+                    );
+                }
+                handle_poll_failure(&ctx, &meter, e);
+            }
         }
     }
 }
@@ -724,11 +780,7 @@ async fn handle_sample(ctx: &TaskCtx, meter: &MeterRuntime, points: Vec<(String,
         meter_id: meter.record.id,
         snapshot_json: serde_json::to_string(&points).unwrap_or_default(),
         read_ms: now,
-        sample_interval_s: if ctx.state.continuous_pull_enabled(meter.record.id) {
-            5
-        } else {
-            meter.record.collect_interval_s
-        },
+        sample_interval_s: effective_collect_interval_s(ctx.state.continuous_pull_enabled(meter.record.id)),
         quality,
     };
     let result = ctx.store.save_sample(&reading, now).map(|_| ());
@@ -928,6 +980,10 @@ async fn flush_sample_batch(ctx: &TaskCtx) {
     if rows.is_empty() {
         return;
     }
+    if stale_unbatched_batch(ctx, &rows) {
+        discard_stale_unbatched_batch(ctx, rows).await;
+        return;
+    }
     let mut samples = Vec::with_capacity(rows.len());
     let mut sample_ids = Vec::with_capacity(rows.len());
     for row in rows {
@@ -996,12 +1052,67 @@ async fn flush_sample_batch(ctx: &TaskCtx) {
     }
 }
 
+fn stale_unbatched_batch(ctx: &TaskCtx, rows: &[gw_store::SampleRecord]) -> bool {
+    let Some(last_read_ms) = rows.iter().map(|row| row.read_ms).max() else {
+        return false;
+    };
+    let stale_after_ms = ctx
+        .report_interval_s
+        .saturating_mul(STALE_SAMPLE_GRACE_MULTIPLIER)
+        .max(120)
+        .saturating_mul(1_000);
+    last_read_ms.saturating_add(stale_after_ms) < ctx.now_ms()
+}
+
+async fn discard_stale_unbatched_batch(ctx: &TaskCtx, rows: Vec<gw_store::SampleRecord>) {
+    let sample_ids = rows.iter().map(|row| row.id).collect::<Vec<_>>();
+    let first_read_ms = rows.iter().map(|row| row.read_ms).min().unwrap_or(0);
+    let last_read_ms = rows.iter().map(|row| row.read_ms).max().unwrap_or(0);
+    let ts = ctx.now_ms();
+    let gateway_id = ctx.state.gateway_id();
+    let message_id = format!("DROP-BATCH-{gateway_id}-{ts}");
+    let payload = serde_json::json!({
+        "type": "STALE_SAMPLE_DROP",
+        "messageId": message_id,
+        "gatewaySn": ctx.state.gateway_sn(),
+        "timestamp": ts,
+        "sampleCount": sample_ids.len(),
+        "firstReadMs": first_read_ms,
+        "lastReadMs": last_read_ms,
+        "reason": "unbatched samples are older than the realtime upload freshness window"
+    });
+    let Ok(bytes) = serde_json::to_vec(&payload) else {
+        tracing::warn!("陈旧样本丢弃审计报文序列化失败");
+        return;
+    };
+    let item = gw_store::NewOutbox {
+        message_id,
+        topic: format!("local/{gateway_id}/data/stale-sample-drop"),
+        payload: bytes,
+        created_ms: ts,
+    };
+    match ctx.store.enqueue_sample_batch(&item, "sent", &sample_ids) {
+        Ok(true) => ctx.emitter.emit(
+            "WARN",
+            "batch",
+            format!(
+                "跳过 {} 条陈旧未归批样本（{}..{}），不作为实时数据上报",
+                sample_ids.len(),
+                first_read_ms,
+                last_read_ms
+            ),
+        ),
+        Ok(false) => {}
+        Err(e) => tracing::warn!("陈旧样本标记失败: {e}"),
+    }
+}
+
 /// 采集失败：连续 3 次判离线。
 fn handle_poll_failure(ctx: &TaskCtx, meter: &MeterRuntime, error: gw_collector::TransportError) {
     let mut went_offline = false;
     ctx.state.update_meter(meter.record.id, |m| {
         m.consecutive_failures += 1;
-        if m.consecutive_failures == 3 {
+        if m.consecutive_failures == DEVICE_OFFLINE_FAILURE_THRESHOLD {
             m.online = false;
             went_offline = true;
         }
