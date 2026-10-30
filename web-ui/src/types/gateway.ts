@@ -6,6 +6,8 @@ export interface ThingModel {profile:string;name:string;version:string;source:'L
 export interface GatewayEvent { id:string; time:string; level:'INFO'|'WARN'|'ERROR'; source:string; message:string; status:'ACTIVE'|'RECOVERED'|'ACKED'|'LOG'; delivery:string }
 export interface UploadRecord { id:number; time:string; deviceSn:string; points:number; type:string; accessStatus:string; dataStatus:string; latency:number }
 export interface CommandRecord { id:string; time:string; type:string; target:string; status:'SUCCESS'|'PENDING'|'FAILED'; message:string }
+export interface UploadRecordPage {pageNum:number;pageSize:number;total:number;rows:UploadRecord[]}
+export interface CommandRecordPage {pageNum:number;pageSize:number;total:number;rows:CommandRecord[]}
 export interface WifiNetwork { ssid:string; signal:number; security:string; connected:boolean }
 export interface AlarmRule {id:number;ruleCode:string;source:'LOCAL'|'PLATFORM';name:string;level:'INFO'|'WARN'|'ERROR'|string;targetDeviceSn:string|null;pointCode:string;operator:string;threshold:number;unit:string;durationS:number;enabled:boolean;locked:boolean;updated:string}
 export interface AlarmRuleConfig {syncIntervalS:number;lastSync:string;rules:AlarmRule[]}

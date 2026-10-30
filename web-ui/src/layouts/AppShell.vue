@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, watchEffect } from 'vue'
 import { RouterLink, RouterView, useRoute } from 'vue-router'
-import { Clock3, Cloud, RefreshCw } from 'lucide-vue-next'
+import { Clock3, Cloud } from 'lucide-vue-next'
 import { navigation } from '../config/navigation'
 import { useGatewayStore } from '../stores/gateway'
 import AppDialog from '../components/AppDialog.vue'
@@ -41,7 +41,7 @@ onMounted(async()=>{
         <header class="topbar">
           <RouterLink to="/overview/dashboard" class="brand"><img src="/gateway-logo.png" alt="平台 Logo"><div><strong>智能园管AI采集边缘网关系统</strong><small>EDGE GATEWAY · {{store.snapshot?.gatewaySn??'正在读取'}}</small></div></RouterLink>
           <nav class="top-nav"><RouterLink v-for="item in navigation" :key="item.path" :to="item.children[0].path" :class="{active:route.path.startsWith(item.path)}"><component :is="item.icon"/><span>{{item.label}}</span><small>{{item.code}}</small></RouterLink></nav>
-          <div class="top-status"><span><Cloud/>{{store.snapshot?.cloudOnline?'平台在线':'平台离线'}}</span><span><Clock3/>{{store.snapshot?.lastPublish??'--:--:--'}}</span><button class="icon-only refresh-action" title="刷新" @click="store.refresh"><RefreshCw :class="{spin:store.loading}"/></button></div>
+          <div class="top-status"><span><Cloud/>{{store.snapshot?.cloudOnline?'平台在线':'平台离线'}}</span><span><Clock3/>{{store.snapshot?.lastPublish??'--:--:--'}}</span></div>
         </header>
         <div class="workspace">
           <aside class="sidebar"><div class="side-title"><span>{{activeGroup.code}}</span><strong>{{activeGroup.label}}</strong></div><nav><RouterLink v-for="item in activeGroup.children" :key="item.path" :to="item.path"><component :is="item.icon"/><div><strong>{{item.label}}</strong><small>{{item.hint}}</small></div></RouterLink></nav><div class="device-foot">v{{store.snapshot?.version??'--'}} · copyright@hukaidong</div></aside>

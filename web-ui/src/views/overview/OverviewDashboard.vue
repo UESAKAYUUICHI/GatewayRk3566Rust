@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { Activity, ArrowLeft, Cpu, Gauge, Radio, RefreshCw, ServerCog, Wifi, Zap, ChartNoAxesColumn } from 'lucide-vue-next'
+import { Activity, ArrowLeft, Cpu, Eye, Gauge, Radio, RefreshCw, ServerCog, Wifi, X, Zap, ChartNoAxesColumn } from 'lucide-vue-next'
 import * as echarts from 'echarts/core'
 import { GridComponent, TooltipComponent, type GridComponentOption, type TooltipComponentOption } from 'echarts/components'
 import { LineChart, type LineSeriesOption } from 'echarts/charts'
@@ -21,7 +21,8 @@ type DetailPeriod = 'segment' | 'day' | 'week' | 'year'
 const store = useGatewayStore()
 const s = computed(() => store.snapshot)
 const totalPower = computed(() => s.value?.meters.reduce((n, m) => n + m.power, 0).toFixed(2) ?? '0.00')
-const selectedMeter = ref<Meter | null>(null)
+const selectedMeterId = ref<number | null>(null)
+const selectedMeter = computed(() => s.value?.meters.find(meter => meter.id === selectedMeterId.value) ?? null)
 const deviceTab = ref<DeviceTab>('overview')
 const detailPeriod = ref<DetailPeriod>('segment')
 const eventLevelFilter = ref('')
@@ -31,17 +32,20 @@ const eventPage = ref(1)
 const detailChartEl = ref<HTMLDivElement>()
 const deviceHistory = ref<CollectSample[]>([])
 const channels = ref<Rs485Channel[]>([])
+const eventDetail = ref<GatewayEvent | null>(null)
+const STALE_POINT_MS = 65_000
 const eventLevelOptions: SideSelectOption[] = [
   { label: '全部级别', value: '' },
-  { label: 'INFO', value: 'INFO' },
-  { label: 'WARN', value: 'WARN' },
-  { label: 'ERROR', value: 'ERROR' },
+  { label: '提示', value: 'INFO' },
+  { label: '警告', value: 'WARN' },
+  { label: '严重', value: 'ERROR' },
 ]
 const eventStatusOptions: SideSelectOption[] = [
   { label: '全部状态', value: '' },
-  { label: 'ACTIVE', value: 'ACTIVE' },
-  { label: 'RECOVERED', value: 'RECOVERED' },
-  { label: 'LOG', value: 'LOG' },
+  { label: '生效中', value: 'ACTIVE' },
+  { label: '已恢复', value: 'RECOVERED' },
+  { label: '已确认', value: 'ACKED' },
+  { label: '日志', value: 'LOG' },
 ]
 const activeEvents = computed(() => s.value?.events.filter(event => event.status === 'ACTIVE') ?? [])
 const selectedEvents = computed(() => {
@@ -68,7 +72,7 @@ const selectedChannel = computed<Rs485Channel | null>(() => {
 const deviceTabs: Array<{ key: DeviceTab; label: string; icon: typeof Gauge }> = [
   { key: 'overview', label: '运行概况', icon: Gauge },
   { key: 'points', label: '实时测点', icon: Zap },
-  { key: 'channel', label: '接入配置', icon: Radio },
+  { key: 'channel', label: '采集健康', icon: Radio },
   { key: 'events', label: '告警事件', icon: Activity },
 ]
 const detailPeriods: Array<{ key: DetailPeriod; label: string }> = [
@@ -117,7 +121,7 @@ function deviceStatusText(meter: Meter) {
 }
 
 async function openDevice(meter: Meter) {
-  selectedMeter.value = meter
+  selectedMeterId.value = meter.id
   deviceTab.value = 'overview'
   detailPeriod.value = 'segment'
   eventPage.value = 1
@@ -131,7 +135,8 @@ async function openDevice(meter: Meter) {
 }
 
 function closeDevice() {
-  selectedMeter.value = null
+  selectedMeterId.value = null
+  eventDetail.value = null
   detailResizeObserver?.disconnect()
   detailResizeObserver = undefined
   detailChart?.dispose()
@@ -141,6 +146,23 @@ function closeDevice() {
 function valueText(value: number | null | undefined, unit = '') {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return '--'
   return `${Number(value).toFixed(2)}${unit ? ` ${unit}` : ''}`
+}
+
+function pointStale(point: Meter['points'][number]) {
+  const valueOk = point.value !== null && point.value !== undefined && !Number.isNaN(Number(point.value))
+  const collectTime = Number(point.collectTime)
+  if (!valueOk || !Number.isFinite(collectTime) || collectTime <= 0) return true
+  return Date.now() - collectTime > STALE_POINT_MS
+}
+
+function displayPointValue(point: Meter['points'][number]) {
+  if (pointStale(point)) return '--'
+  return valueText(point.value, point.unit)
+}
+
+function displayCollectTime(point: Meter['points'][number]) {
+  if (pointStale(point)) return '连续未采集'
+  return formatCollectTime(point.collectTime)
 }
 
 function qualityText(quality: number) {
@@ -160,13 +182,39 @@ function formatCollectTime(value: number | string | null | undefined) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 
+function formatReadTime(value: string | null | undefined) {
+  if (!value) return '未读取'
+  const parsed = Number(value)
+  if (Number.isFinite(parsed) && parsed > 0) return formatCollectTime(parsed)
+  return value
+}
+
+function accessStateText(meter: Meter) {
+  if (!meter.enabled) return '未加入采集'
+  if (!selectedChannel.value) return '通道未配置'
+  if (!selectedChannel.value.enabled) return '通道停用'
+  return meter.online ? '链路在线' : '等待设备响应'
+}
+
+function accessStateTone(meter: Meter) {
+  if (!meter.enabled || !selectedChannel.value || !selectedChannel.value.enabled) return 'danger'
+  return meter.online ? 'success' : 'warn'
+}
+
 function shortDeviceName(name: string) {
   const compact = name.replace(/\s+/g, '')
   return compact || '现场设备'
 }
 
 function ensureDetailChart() {
-  if (!detailChartEl.value || detailChart) return
+  if (!detailChartEl.value) return
+  if (detailChart && detailChart.getDom() !== detailChartEl.value) {
+    detailResizeObserver?.disconnect()
+    detailResizeObserver = undefined
+    detailChart.dispose()
+    detailChart = undefined
+  }
+  if (detailChart) return
   detailChart = echarts.init(detailChartEl.value)
   detailResizeObserver = new ResizeObserver(() => detailChart?.resize())
   detailResizeObserver.observe(detailChartEl.value)
@@ -252,6 +300,7 @@ function renderDetailChart() {
     series,
   }
   detailChart.setOption(option, true)
+  detailChart.resize()
 }
 
 function switchPeriod(period: DetailPeriod) {
@@ -260,6 +309,12 @@ function switchPeriod(period: DetailPeriod) {
 }
 
 function switchDeviceTab(tab: DeviceTab) {
+  if (deviceTab.value === 'overview' && tab !== 'overview') {
+    detailResizeObserver?.disconnect()
+    detailResizeObserver = undefined
+    detailChart?.dispose()
+    detailChart = undefined
+  }
   deviceTab.value = tab
   if (tab === 'overview') {
     nextTick(() => {
@@ -269,11 +324,58 @@ function switchDeviceTab(tab: DeviceTab) {
   }
 }
 
+function eventLevelText(level: string) {
+  const map: Record<string, string> = { INFO: '提示', WARN: '警告', ERROR: '严重' }
+  return map[level] ?? level
+}
+
+function eventStatusText(status: string) {
+  const map: Record<string, string> = { ACTIVE: '生效中', RECOVERED: '已恢复', ACKED: '已确认', LOG: '日志' }
+  return map[status] ?? status
+}
+
+function eventLevelTone(level: string) {
+  if (level === 'ERROR') return 'danger'
+  if (level === 'WARN') return 'warn'
+  return 'info'
+}
+
+function eventStatusTone(status: string) {
+  if (status === 'ACTIVE') return 'danger'
+  if (status === 'RECOVERED') return 'success'
+  if (status === 'ACKED') return 'warn'
+  return 'muted'
+}
+
+function eventDate(time: string) {
+  if (!time) return '--'
+  const matched = time.match(/^(\d{4}-\d{2}-\d{2})/)
+  return matched ? matched[1] : '--'
+}
+
+function eventTime(time: string) {
+  if (!time) return '--'
+  const matched = time.match(/(?:^|[T ])(\d{2}:\d{2}(?::\d{2})?)/)
+  return matched ? matched[1] : '--'
+}
+
+function showEventDetail(event: GatewayEvent) {
+  eventDetail.value = event
+}
+
 onMounted(async () => {
   await loadChannels()
 })
 
 watch([eventLevelFilter, eventStatusFilter, eventKeyword], () => { eventPage.value = 1 })
+watch(selectedMeter, async meter => {
+  if (!meter) return
+  if (deviceTab.value === 'overview') {
+    await nextTick()
+    ensureDetailChart()
+    renderDetailChart()
+  }
+}, { deep: true, immediate: true })
 onBeforeUnmount(() => { detailResizeObserver?.disconnect(); detailChart?.dispose() })
 </script>
 
@@ -375,23 +477,38 @@ onBeforeUnmount(() => { detailResizeObserver?.disconnect(); detailChart?.dispose
               <article v-for="point in selectedMeter.points" :key="point.code" class="device-point-card">
                 <small>{{point.code}}</small>
                 <strong>{{point.name || point.code}}</strong>
-                <b>{{valueText(point.value, point.unit)}}</b>
-                <span>{{qualityText(point.quality)}} · {{formatCollectTime(point.collectTime)}}</span>
+                <b>{{displayPointValue(point)}}</b>
+                <span>{{qualityText(point.quality)}} · {{displayCollectTime(point)}}</span>
               </article>
               <div v-if="!selectedMeter.points.length" class="empty-row">暂无实时测点。</div>
             </section>
 
             <section v-else-if="deviceTab==='channel'" class="device-access-pane">
-              <div class="access-flow">
-                <span>设备</span><i></i><span>RS485 总线</span><i></i><span>边缘采集</span><i></i><span>本地缓存/上报</span>
+              <div class="health-strip">
+                <article>
+                  <small>链路状态</small>
+                  <strong><b class="event-pill" :class="accessStateTone(selectedMeter)">{{accessStateText(selectedMeter)}}</b></strong>
+                  <span>{{selectedMeter.enabled ? '已加入轮询队列' : '未启用采集'}}</span>
+                </article>
+                <article>
+                  <small>最近采样</small>
+                  <strong>{{formatReadTime(selectedMeter.lastRead)}}</strong>
+                  <span>{{selectedMeter.points.length}} 个测点 · {{qualityText(selectedMeter.points[0]?.quality ?? 2)}}</span>
+                </article>
+                <article>
+                  <small>上报队列</small>
+                  <strong>{{s?.pending ?? 0}} 批</strong>
+                  <span>{{s?.cloudOnline ? '平台链路正常' : '平台链路异常'}}</span>
+                </article>
               </div>
               <dl class="access-config-list">
                 <div><dt>绑定通道</dt><dd>{{selectedChannel?.name || selectedMeter.channelId}}</dd><small>{{selectedChannel?.port || '串口未读取'}} · {{selectedChannel?.enabled ? '通道启用' : '通道停用'}}</small></div>
-                <div><dt>串口参数</dt><dd>{{selectedChannel ? `${selectedChannel.baud} bps · ${selectedChannel.dataBits}${selectedChannel.parity}/${selectedChannel.stopBits}` : '--'}}</dd><small>与现场仪表串口参数必须一致</small></div>
-                <div><dt>Modbus 地址</dt><dd>{{selectedMeter.address}}</dd><small>同一 RS485 通道下地址不可重复</small></div>
-                <div><dt>采集策略</dt><dd>{{selectedMeter.collectIntervalS}} 秒 / {{selectedMeter.continuousPull ? '连续轮询' : '周期轮询'}}</dd><small>{{selectedMeter.enabled ? '设备已加入采集队列' : '设备未启用采集'}}</small></div>
-                <div><dt>物模型</dt><dd>{{selectedMeter.profile}}</dd><small>{{selectedMeter.modelVersion || '本地版本'}} · {{selectedMeter.points.length}} 个实时测点</small></div>
-                <div><dt>上报链路</dt><dd>{{selectedMeter.uploadEnabled ? '允许上报平台' : '仅本地保留'}}</dd><small>{{s?.cloudOnline ? 'MQTT 链路正常' : '平台链路异常'}}</small></div>
+                <div><dt>串口参数</dt><dd>{{selectedChannel ? `${selectedChannel.baud} bps · ${selectedChannel.dataBits}${selectedChannel.parity}/${selectedChannel.stopBits}` : '--'}}</dd><small>需与现场仪表保持一致</small></div>
+                <div><dt>Modbus 从站</dt><dd>{{selectedMeter.address}}</dd><small>{{selectedMeter.channelId}} 下地址不可重复</small></div>
+                <div><dt>采集策略</dt><dd>{{selectedMeter.collectIntervalS}} 秒 / {{selectedMeter.continuousPull ? '连续轮询' : '周期轮询'}}</dd><small>{{selectedMeter.points.length}} 个实时测点 · {{selectedMeter.profile}}</small></div>
+                <div><dt>设备状态</dt><dd>{{deviceStatusText(selectedMeter)}}</dd><small>{{selectedMeter.online ? '最近采集有响应' : '等待新的采集响应'}}</small></div>
+                <div><dt>上报策略</dt><dd>{{selectedMeter.uploadEnabled ? '允许上报平台' : '仅本地保留'}}</dd><small>{{selectedMeter.configSource === 'PLATFORM' ? '由平台同步配置' : '本地配置'}}</small></div>
+                <div><dt>模型版本</dt><dd>{{selectedMeter.modelVersion || '--'}}</dd><small>{{selectedMeter.profile}}</small></div>
               </dl>
             </section>
 
@@ -402,8 +519,15 @@ onBeforeUnmount(() => { detailResizeObserver?.disconnect(); detailChart?.dispose
                 <SideSelect v-model="eventStatusFilter" :options="eventStatusOptions" />
               </div>
               <div class="device-detail-table event-table">
-                <div class="device-detail-head"><span>时间</span><span>级别</span><span>状态</span><span>内容</span></div>
-                <div v-for="event in pagedSelectedEvents" :key="event.id" class="device-detail-row"><span>{{event.time}}</span><span>{{event.level}}</span><span>{{event.status}}</span><span>{{event.message}}</span></div>
+                <div class="device-detail-head event-detail-head"><span>时间</span><span>日期</span><span>级别</span><span>状态</span><span>内容</span><span>操作</span></div>
+                <div v-for="event in pagedSelectedEvents" :key="event.id" class="device-detail-row event-detail-row">
+                  <span>{{eventTime(event.time)}}</span>
+                  <span>{{eventDate(event.time)}}</span>
+                  <span><b class="event-pill" :class="eventLevelTone(event.level)">{{eventLevelText(event.level)}}</b></span>
+                  <span><b class="event-pill" :class="eventStatusTone(event.status)">{{eventStatusText(event.status)}}</b></span>
+                  <span class="event-message" :title="event.message">{{event.message}}</span>
+                  <span><button class="icon-only event-detail-action" title="查看详情" @click="showEventDetail(event)"><Eye/></button></span>
+                </div>
                 <div v-if="!pagedSelectedEvents.length" class="empty-row">暂无符合条件的事件。</div>
               </div>
               <footer class="event-pagination">
@@ -417,6 +541,27 @@ onBeforeUnmount(() => { detailResizeObserver?.disconnect(); detailChart?.dispose
         </div>
       </section>
     </div>
+
+    <Teleport to="body">
+      <div v-if="eventDetail" class="dialog-mask" @click.self="eventDetail=null">
+        <section class="dialog event-detail-dialog">
+          <header><Eye/><strong>告警事件详情</strong><button @click="eventDetail=null"><X/></button></header>
+          <dl class="event-detail-grid">
+            <div><dt>日期</dt><dd>{{eventDate(eventDetail.time)}}</dd></div>
+            <div><dt>时间</dt><dd>{{eventTime(eventDetail.time)}}</dd></div>
+            <div><dt>级别</dt><dd><b class="event-pill" :class="eventLevelTone(eventDetail.level)">{{eventLevelText(eventDetail.level)}}</b></dd></div>
+            <div><dt>状态</dt><dd><b class="event-pill" :class="eventStatusTone(eventDetail.status)">{{eventStatusText(eventDetail.status)}}</b></dd></div>
+            <div><dt>来源</dt><dd>{{eventDetail.source}}</dd></div>
+            <div><dt>投递</dt><dd>{{eventDetail.delivery || '--'}}</dd></div>
+          </dl>
+          <section class="event-detail-block">
+            <h3>内容</h3>
+            <p>{{eventDetail.message}}</p>
+          </section>
+          <footer><button class="btn primary" @click="eventDetail=null">关闭</button></footer>
+        </section>
+      </div>
+    </Teleport>
 
   </div>
 </template>

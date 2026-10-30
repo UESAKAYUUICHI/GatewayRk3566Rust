@@ -349,6 +349,24 @@ pub struct CollectHistoryPageDto {
     rows: Vec<CollectSampleDto>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandPageDto {
+    page_num: u32,
+    page_size: u32,
+    total: u64,
+    rows: Vec<CommandDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadPageDto {
+    page_num: u32,
+    page_size: u32,
+    total: u64,
+    rows: Vec<UploadDto>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PageQuery {
@@ -789,6 +807,7 @@ pub fn router(state: WebState, web_root: PathBuf) -> Router {
         .route("/api/v1/camera/snapshot", get(camera_snapshot))
         .route("/api/v1/system/environment", get(system_environment))
         .route("/api/v1/system/diagnostics", get(system_diagnostics))
+        .route("/api/v1/system/restart-browser", post(restart_browser))
         .route("/api/v1/system/restart-service", post(restart_service))
         .route("/api/v1/system/shutdown-machine", post(shutdown_machine))
         .route("/api/v1/system/reboot-machine", post(reboot_machine))
@@ -1498,6 +1517,23 @@ async fn restart_service() -> ApiResult<Accepted> {
     Ok(Json(Accepted { accepted: true }))
 }
 
+async fn restart_browser() -> ApiResult<Accepted> {
+    let script = r#"
+        if [ -x /usr/local/sbin/park-gateway-restart-browser ]; then
+            sudo -n /usr/local/sbin/park-gateway-restart-browser
+        else
+            pkill -u kickpi -f 'chromium.*park-gateway-kiosk' 2>/dev/null || true
+            sleep 1
+            su - kickpi -c 'DISPLAY=:0 XAUTHORITY=/home/kickpi/.Xauthority nohup /usr/local/bin/park-gateway-kiosk >/tmp/park-gateway-kiosk-restart.log 2>&1 &'
+        fi
+    "#;
+    Command::new("sh")
+        .args(["-c", &format!("({script}) >/tmp/park-gateway-browser-restart.log 2>&1 &")])
+        .spawn()
+        .map_err(|error| ApiError::internal(format!("无法发起浏览器重启: {error}")))?;
+    Ok(Json(Accepted { accepted: true }))
+}
+
 async fn shutdown_machine() -> ApiResult<Accepted> {
     schedule_power_action(
         "systemctl poweroff",
@@ -1676,22 +1712,52 @@ async fn weekly_metrics(
 
 async fn commands(
     State(state): State<WebState>,
-    Query(query): Query<LimitQuery>,
-) -> ApiResult<Vec<CommandDto>> {
-    Ok(Json(load_commands(
-        &state.store,
-        query.limit.unwrap_or(100).min(500),
-    )?))
+    Query(query): Query<PageQuery>,
+) -> ApiResult<CommandPageDto> {
+    let page_num = query.page_num.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(80).clamp(10, 200);
+    let total = state
+        .store
+        .count_commands()
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let rows = state
+        .store
+        .paged_commands(page_num, page_size)
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .into_iter()
+        .map(command_dto)
+        .collect();
+    Ok(Json(CommandPageDto {
+        page_num,
+        page_size,
+        total,
+        rows,
+    }))
 }
 
 async fn uploads(
     State(state): State<WebState>,
-    Query(query): Query<LimitQuery>,
-) -> ApiResult<Vec<UploadDto>> {
-    Ok(Json(load_uploads(
-        &state.store,
-        query.limit.unwrap_or(100).min(500),
-    )?))
+    Query(query): Query<PageQuery>,
+) -> ApiResult<UploadPageDto> {
+    let page_num = query.page_num.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(80).clamp(10, 200);
+    let total = state
+        .store
+        .count_outbox()
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let rows = state
+        .store
+        .paged_outbox(page_num, page_size)
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .into_iter()
+        .map(upload_dto)
+        .collect();
+    Ok(Json(UploadPageDto {
+        page_num,
+        page_size,
+        total,
+        rows,
+    }))
 }
 
 async fn alarm_rules(State(state): State<WebState>) -> ApiResult<AlarmRuleConfigDto> {
@@ -2875,7 +2941,7 @@ fn load_events(store: &Store, limit: u32) -> Result<Vec<EventDto>, ApiError> {
                 alarm.last_seen_ms,
                 EventDto {
                     id: format!("alarm:{}:{}", alarm.source, alarm.source_event_id),
-                    time: format_time(alarm.last_seen_ms),
+                    time: format_event_time(alarm.last_seen_ms),
                     level: level.into(),
                     source: if alarm.source == "PLATFORM" {
                         "平台告警".into()
@@ -2893,7 +2959,7 @@ fn load_events(store: &Store, limit: u32) -> Result<Vec<EventDto>, ApiError> {
                 e.ts_ms,
                 EventDto {
                     id: format!("event:{}:{index}", e.ts_ms),
-                    time: format_time(e.ts_ms),
+                    time: format_event_time(e.ts_ms),
                     level: e.level,
                     source: e.source,
                     message: e.message,
@@ -2913,14 +2979,7 @@ fn load_commands(store: &Store, limit: u32) -> Result<Vec<CommandDto>, ApiError>
         .recent_commands(limit)
         .map_err(|e| ApiError::internal(e.to_string()))?
         .into_iter()
-        .map(|c| CommandDto {
-            id: c.command_id,
-            time: format_time(c.received_ms),
-            r#type: c.command_type,
-            target: c.target_sn,
-            status: normalize_status(&c.result_status),
-            message: c.message,
-        })
+        .map(command_dto)
         .collect())
 }
 
@@ -2928,45 +2987,55 @@ fn load_uploads(store: &Store, limit: u32) -> Result<Vec<UploadDto>, ApiError> {
     let rows = store
         .recent_outbox(limit)
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            let json: serde_json::Value = serde_json::from_slice(&row.payload).unwrap_or_default();
-            let samples = json
-                .pointer("/data/meters")
-                .or_else(|| json.get("meters"))
-                .and_then(|v| v.as_array());
-            let device_sn = samples
-                .and_then(|v| v.first())
-                .and_then(|v| v.get("deviceSn"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("汇总报文")
-                .to_string();
-            let points = samples
-                .map(|items| {
-                    items
-                        .iter()
-                        .map(|item| {
-                            item.get("points")
-                                .and_then(|v| v.as_object())
-                                .map(|v| v.len())
-                                .unwrap_or(0)
-                        })
-                        .sum()
+    Ok(rows.into_iter().map(upload_dto).collect())
+}
+
+fn command_dto(c: gw_store::CommandLogRow) -> CommandDto {
+    CommandDto {
+        id: c.command_id,
+        time: format_time(c.received_ms),
+        r#type: c.command_type,
+        target: c.target_sn,
+        status: normalize_status(&c.result_status),
+        message: c.message,
+    }
+}
+
+fn upload_dto(row: gw_store::OutboxRecord) -> UploadDto {
+    let json: serde_json::Value = serde_json::from_slice(&row.payload).unwrap_or_default();
+    let samples = json
+        .pointer("/data/meters")
+        .or_else(|| json.get("meters"))
+        .and_then(|v| v.as_array());
+    let device_sn = samples
+        .and_then(|v| v.first())
+        .and_then(|v| v.get("deviceSn"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("汇总报文")
+        .to_string();
+    let points = samples
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    item.get("points")
+                        .and_then(|v| v.as_object())
+                        .map(|v| v.len())
+                        .unwrap_or(0)
                 })
-                .unwrap_or(0);
-            UploadDto {
-                id: row.id,
-                time: format_time(row.created_ms),
-                device_sn,
-                points,
-                r#type: "DATA_UPLOAD".into(),
-                access_status: upload_access_status(&row.status).into(),
-                data_status: upload_data_status(&row.status, row.last_error.as_deref()).into(),
-                latency: 0,
-            }
+                .sum()
         })
-        .collect())
+        .unwrap_or(0);
+    UploadDto {
+        id: row.id,
+        time: format_time(row.created_ms),
+        device_sn,
+        points,
+        r#type: "DATA_UPLOAD".into(),
+        access_status: upload_access_status(&row.status).into(),
+        data_status: upload_data_status(&row.status, row.last_error.as_deref()).into(),
+        latency: 0,
+    }
 }
 
 fn upload_access_status(status: &str) -> &'static str {
@@ -3412,6 +3481,14 @@ fn format_time(ms: u64) -> String {
     }
     DateTime::<Local>::from(std::time::UNIX_EPOCH + Duration::from_millis(ms))
         .format("%H:%M:%S")
+        .to_string()
+}
+fn format_event_time(ms: u64) -> String {
+    if ms == 0 {
+        return "----/--/-- --:--:--".into();
+    }
+    DateTime::<Local>::from(std::time::UNIX_EPOCH + Duration::from_millis(ms))
+        .format("%Y-%m-%d %H:%M:%S")
         .to_string()
 }
 fn format_date(ms: u64) -> String {

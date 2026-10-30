@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
+import { RefreshCw, RotateCcw } from 'lucide-vue-next'
 import PageHeader from '../../components/PageHeader.vue'
 import StatusBadge from '../../components/StatusBadge.vue'
-import { fetchSystemDiagnostics, fetchSystemEnvironment, gatewayAction } from '../../services/gateway-api'
+import { fetchSystemEnvironment, gatewayAction } from '../../services/gateway-api'
 import { useGatewayStore } from '../../stores/gateway'
 import type { SystemEnvironment } from '../../types/gateway'
 import { useDialog } from '../../composables/useDialog'
@@ -34,21 +35,13 @@ async function loadEnvironment() {
   }
 }
 
-async function exportDiagnostics() {
+async function restartBrowser() {
   actionBusy.value = true
   try {
-    const blob = await fetchSystemDiagnostics()
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = `park-gateway-diagnostics-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.txt`
-    document.body.appendChild(link)
-    link.click()
-    link.remove()
-    URL.revokeObjectURL(url)
-    show('诊断包已生成', '系统诊断信息已导出。')
+    await gatewayAction('/v1/system/restart-browser')
+    show('浏览器正在重启', '当前屏幕浏览器会关闭并自动重新打开。')
   } catch (error) {
-    show('导出失败', error instanceof Error ? error.message : '诊断包导出失败', true)
+    show('重启失败', error instanceof Error ? error.message : '浏览器重启失败', true)
   } finally {
     actionBusy.value = false
   }
@@ -108,7 +101,7 @@ onMounted(loadEnvironment)
 
 <template>
   <div class="page system-info-page">
-    <PageHeader title="系统信息"><button class="btn" :disabled="envLoading" @click="loadEnvironment">{{envLoading ? '刷新中...' : '刷新环境'}}</button><button class="btn" :disabled="actionBusy" @click="exportDiagnostics">导出诊断包</button><button class="btn danger" :disabled="actionBusy" @click="restartService">重启服务</button><button class="btn danger" :disabled="actionBusy" @click="openPowerConfirm('shutdown')">关机</button><button class="btn danger power-danger" :disabled="actionBusy" @click="openPowerConfirm('reboot')">重启机器</button></PageHeader>
+    <PageHeader title="系统信息"><button class="icon-only refresh-action" title="刷新环境" :disabled="envLoading" @click="loadEnvironment"><RefreshCw :class="{spin:envLoading}"/></button><button class="btn" :disabled="actionBusy" @click="restartBrowser"><RotateCcw/>重启浏览器</button><button class="btn danger" :disabled="actionBusy" @click="restartService">重启服务</button><button class="btn danger" :disabled="actionBusy" @click="openPowerConfirm('shutdown')">关机</button><button class="btn danger power-danger" :disabled="actionBusy" @click="openPowerConfirm('reboot')">重启机器</button></PageHeader>
     <section class="system-grid">
       <article class="panel info-panel"><h2>基础信息</h2><dl><div><dt>网关 SN</dt><dd>{{store.snapshot?.gatewaySn}}</dd></div><div><dt>软件版本</dt><dd>v{{store.snapshot?.version}}</dd></div><div><dt>运行时长</dt><dd>{{store.snapshot?.uptime}}</dd></div><div><dt>系统时钟</dt><dd><StatusBadge :ok="store.snapshot?.clockTrusted" :text="store.snapshot?.clockTrusted ? '可信' : '未同步'"/></dd></div></dl></article>
       <article class="panel info-panel"><h2>资源状态</h2><dl><div><dt>CPU</dt><dd>{{environment ? `${environment.cpuCores} 核` : '--'}}</dd></div><div><dt>负载</dt><dd>{{environment?.loadAverage || '--'}}</dd></div><div><dt>内核</dt><dd>{{environment?.kernel || '--'}}</dd></div><div><dt>设备温度</dt><dd>{{environment?.cpuTemperature || '--'}}</dd></div></dl></article>

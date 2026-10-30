@@ -1,4 +1,4 @@
-import type { AlarmRuleConfig, CameraDevice, CollectHistoryPage, GatewaySnapshot, Meter, Rs485Channel, SystemEnvironment, ThingModel, UploadRecord } from '../types/gateway'
+import type { AlarmRuleConfig, CameraDevice, CollectHistoryPage, CommandRecordPage, GatewaySnapshot, Meter, Rs485Channel, SystemEnvironment, ThingModel, UploadRecordPage } from '../types/gateway'
 
 const API_BASE=import.meta.env.VITE_GATEWAY_API_URL??'/api'
 export interface PlatformConfig {gatewayId:string;gatewaySn:string;platformHttpUrl:string;mqttHost:string;mqttPort:number;mqttUsername:string;passwordConfigured:boolean;heartbeatS:number}
@@ -46,7 +46,8 @@ export function cameraSnapshotUrl(device?:string):string{
 }
 export async function fetchAlarmRules():Promise<AlarmRuleConfig>{const r=await fetch(`${API_BASE}/v1/alarm-rules`);if(!r.ok)throw await apiError(r);return r.json()}
 export async function fetchCollectHistory(pageNum=1,pageSize=80):Promise<CollectHistoryPage>{const r=await fetch(`${API_BASE}/v1/collection/history?pageNum=${pageNum}&pageSize=${pageSize}`);if(!r.ok)throw await apiError(r);return r.json()}
-export async function fetchUploadRecords(limit=200):Promise<UploadRecord[]>{const r=await fetch(`${API_BASE}/v1/uploads?limit=${limit}`);if(!r.ok)throw await apiError(r);return r.json()}
+export async function fetchUploadRecords(pageNum=1,pageSize=80):Promise<UploadRecordPage>{const r=await fetch(`${API_BASE}/v1/uploads?pageNum=${pageNum}&pageSize=${pageSize}`);if(!r.ok)throw await apiError(r);return r.json()}
+export async function fetchCommandRecords(pageNum=1,pageSize=80):Promise<CommandRecordPage>{const r=await fetch(`${API_BASE}/v1/commands?pageNum=${pageNum}&pageSize=${pageSize}`);if(!r.ok)throw await apiError(r);return r.json()}
 export async function syncAlarmRules():Promise<AlarmRuleConfig>{const r=await fetch(`${API_BASE}/v1/alarm-rules/sync`,{method:'POST'});if(!r.ok)throw await apiError(r);return r.json()}
 export async function saveAlarmRuleSyncConfig(syncIntervalS:number):Promise<void>{const r=await fetch(`${API_BASE}/v1/alarm-rules/config`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({syncIntervalS})});if(!r.ok)throw await apiError(r)}
 export async function saveAlarmRule(id:number|null,body:unknown):Promise<void>{const r=await fetch(`${API_BASE}/v1/alarm-rules${id?`/${id}`:''}`,{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw await apiError(r)}
@@ -89,4 +90,3 @@ export function connectSnapshotSocket(onSnapshot:(snapshot:GatewaySnapshot)=>voi
 async function apiError(response:Response):Promise<Error>{
   try{const body=await response.json() as {message?:string};return new Error(body.message??`操作失败：${response.status}`)}catch{return new Error(`操作失败：${response.status}`)}
 }
-

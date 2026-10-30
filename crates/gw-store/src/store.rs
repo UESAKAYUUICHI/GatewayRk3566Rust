@@ -1645,6 +1645,38 @@ impl Store {
         Ok(rows)
     }
 
+    pub fn count_outbox(&self) -> StoreResult<u64> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let total: i64 = conn.query_row("SELECT COUNT(1) FROM outbox_message", [], |r| r.get(0))?;
+        Ok(total.max(0) as u64)
+    }
+
+    pub fn paged_outbox(&self, page_num: u32, page_size: u32) -> StoreResult<Vec<OutboxRecord>> {
+        let page_num = page_num.max(1);
+        let page_size = page_size.clamp(1, 500);
+        let offset = (page_num - 1).saturating_mul(page_size);
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, message_id, topic, payload, created_ms, status, attempts, last_error
+             FROM outbox_message ORDER BY created_ms DESC, id DESC LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![page_size, offset], |r| {
+                Ok(OutboxRecord {
+                    id: r.get(0)?,
+                    message_id: r.get(1)?,
+                    topic: r.get(2)?,
+                    payload: r.get(3)?,
+                    created_ms: r.get::<_, i64>(4)? as u64,
+                    status: r.get(5)?,
+                    attempts: r.get::<_, u32>(6)?,
+                    last_error: r.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn mark_sent(&self, id: i64) -> StoreResult<()> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         conn.execute(
@@ -2093,6 +2125,38 @@ impl Store {
         )?;
         let rows = stmt
             .query_map(params![limit], |r| {
+                Ok(CommandLogRow {
+                    command_id: r.get(0)?,
+                    command_type: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    target_sn: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    payload_json: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    received_ms: r.get::<_, i64>(4)? as u64,
+                    result_status: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    responded_ms: r.get::<_, Option<i64>>(6)?.unwrap_or(0) as u64,
+                    message: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn count_commands(&self) -> StoreResult<u64> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let total: i64 = conn.query_row("SELECT COUNT(1) FROM command_log", [], |r| r.get(0))?;
+        Ok(total.max(0) as u64)
+    }
+
+    pub fn paged_commands(&self, page_num: u32, page_size: u32) -> StoreResult<Vec<CommandLogRow>> {
+        let page_num = page_num.max(1);
+        let page_size = page_size.clamp(1, 500);
+        let offset = (page_num - 1).saturating_mul(page_size);
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT command_id, command_type, target_sn, payload, received_ms, result_status, responded_ms, message
+             FROM command_log ORDER BY id DESC LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![page_size, offset], |r| {
                 Ok(CommandLogRow {
                     command_id: r.get(0)?,
                     command_type: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
