@@ -1,0 +1,1 @@
+parkgw ALL=(root) NOPASSWD: /usr/local/sbin/park-gateway-restart-browser

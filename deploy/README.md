@@ -17,6 +17,9 @@ rustup target add aarch64-unknown-linux-gnu
 MODE=release ./deploy/build-arm64.sh
 ```
 
+`MODE=release` 用于日常联调，启用增量编译并提高并行度；答辩验收或正式发布时使用
+`MODE=dist`，执行 Thin LTO 和完整体积优化。
+
 ## 2. 真机联调
 ```bash
 # 板端直接连真实 RS485、真实 MQTT、真实 NetworkManager

@@ -49,6 +49,17 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [profile.release]
+opt-level = 2
+lto = false
+codegen-units = 8
+incremental = true
+strip = "debuginfo"
+
+# 用于答辩验收和正式发布；日常板端联调使用上面的 release，避免每次都做 LTO。
+[profile.dist]
+inherits = "release"
+opt-level = 3
 lto = "thin"
-strip = true
 codegen-units = 1
+incremental = false
+strip = true
