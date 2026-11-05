@@ -1,14 +1,16 @@
 //! MQTT 云链路实现（rumqttc，QoS1）。
 //!
 //! 自持连接生命周期：内部 eventloop 任务负责重连与状态上报，
-//! 指令下行经 mpsc 通道交给 agent；publish 只是入 AsyncClient 内部队列（有界）。
+//! 指令下行经 mpsc 通道交给 agent；publish 等待对应报文的 Broker PUBACK。
 
 use std::time::Duration;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use gw_core::snapshot::LinkHealth;
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, Outgoing, Packet, QoS};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, oneshot, Mutex};
+use crate::acknowledgements::PublishAcknowledgements;
 
 use crate::port::{CloudLink, LinkError, LinkOptions, LinkResult, RawCommand};
 
@@ -16,6 +18,8 @@ use crate::port::{CloudLink, LinkError, LinkOptions, LinkResult, RawCommand};
 pub struct MqttLink {
     client: AsyncClient,
     health_rx: watch::Receiver<LinkHealth>,
+    publish_lock: Mutex<()>,
+    acknowledgements: Arc<Mutex<PublishAcknowledgements>>,
 }
 
 impl MqttLink {
@@ -48,6 +52,8 @@ impl MqttLink {
             }
         });
 
+        let acknowledgements = Arc::new(Mutex::new(PublishAcknowledgements::default()));
+        let loop_acknowledgements = acknowledgements.clone();
         let loop_client = client.clone();
         let handle = tokio::spawn(async move {
             let client = loop_client;
@@ -71,12 +77,13 @@ impl MqttLink {
                             let _ = client.subscribe(topic, QoS::AtLeastOnce).await;
                         }
                     }
-                    Ok(Event::Outgoing(Outgoing::PingReq)) | Ok(_) => {
-                        // poll 正常返回即连接存活
-                        if *health_tx.borrow() != LinkHealth::Connected {
-                            let _ = health_tx.send_replace(LinkHealth::Connected);
-                        }
+                    Ok(Event::Outgoing(Outgoing::Publish(id))) => {
+                        loop_acknowledgements.lock().await.outgoing(id);
                     }
+                    Ok(Event::Incoming(Incoming::PubAck(ack))) => {
+                        loop_acknowledgements.lock().await.acknowledge(ack.pkid);
+                    }
+                    Ok(_) => {}
                     Err(e) => {
                         tracing::warn!("MQTT 链路异常，将退避重连: {e}");
                         let _ = health_tx.send_replace(LinkHealth::Down);
@@ -87,23 +94,37 @@ impl MqttLink {
             }
         });
 
-        (Self { client, health_rx }, handle)
+        (Self { client, health_rx, publish_lock: Mutex::new(()), acknowledgements }, handle)
     }
 }
 
 #[async_trait]
 impl CloudLink for MqttLink {
     async fn publish(&self, topic: &str, payload: &[u8]) -> LinkResult<()> {
+        let _guard = self.publish_lock.lock().await;
         if *self.health_rx.borrow() != LinkHealth::Connected {
             return Err(LinkError::NotConnected);
         }
-        self.client
-            .publish(topic, QoS::AtLeastOnce, false, payload)
-            .await
-            .map_err(|e| LinkError::Mqtt(format!("publish 入队失败: {e}")))
+        if payload.len() + topic.len() + 32 > 256 * 1024 {
+            return Err(LinkError::Mqtt("publish exceeds packet size limit".into()));
+        }
+        let (sender, receiver) = oneshot::channel();
+        {
+            let mut tracker = self.acknowledgements.lock().await;
+            self.client.try_publish(topic, QoS::AtLeastOnce, false, payload)
+                .map_err(|e| LinkError::Mqtt(format!("publish enqueue failed: {e}")))?;
+            tracker.enqueue(sender);
+        }
+        tokio::time::timeout(Duration::from_secs(30), receiver).await
+            .map_err(|_| LinkError::Mqtt("Broker PUBACK timeout".into()))?
+            .map_err(|_| LinkError::Mqtt("Broker acknowledgement channel closed".into()))
     }
 
     fn health(&self) -> LinkHealth {
         *self.health_rx.borrow()
     }
 }
+
+#[cfg(test)]
+#[path = "mqtt_tests.rs"]
+mod tests;

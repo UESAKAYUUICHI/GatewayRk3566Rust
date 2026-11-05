@@ -14,6 +14,7 @@ pub const QUALITY_NORMAL: u32 = 0;
 /// 保持为 1 是为了兼容已有的“非零质量为告警”展示逻辑，同时由云侧
 /// 将它区分为可追溯但不参与计量统计的回退样本。
 pub const QUALITY_ROLLBACK: u32 = 1;
+pub const QUALITY_CLOCK_UNTRUSTED: u32 = 2;
 pub const COMMAND_STATUS_SUCCESS: &str = "SUCCESS";
 pub const COMMAND_STATUS_FAILED: &str = "FAILED";
 

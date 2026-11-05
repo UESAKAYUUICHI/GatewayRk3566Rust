@@ -16,3 +16,6 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 rumqttc = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net"] }

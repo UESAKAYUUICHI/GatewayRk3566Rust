@@ -15,7 +15,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut result = Args {
         config: None,
         web_root: "web-ui/dist".into(),
-        bind: "0.0.0.0:8080".into(),
+        bind: "127.0.0.1:8080".into(),
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {

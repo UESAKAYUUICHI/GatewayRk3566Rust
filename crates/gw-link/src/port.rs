@@ -37,7 +37,7 @@ pub struct RawCommand {
 /// 发布在未连接时应返回 `LinkError::NotConnected` 而非阻塞。
 #[async_trait]
 pub trait CloudLink: Send + Sync {
-    /// 以 QoS1 发布。返回仅代表报文已入队/送达 broker（实现决定语义并负责重试）。
+    /// 以 QoS1 发布。成功返回表示 Broker 已确认；本地入队不能作为成功。
     async fn publish(&self, topic: &str, payload: &[u8]) -> LinkResult<()>;
 
     /// 当前健康状态。

@@ -11,3 +11,6 @@ pub use transport::{MeterTransport, TransportError};
 
 #[cfg(feature = "modbus")]
 pub use modbus_rtus::{ModbusRtuTransport, SerialConfig};
+
+#[cfg(feature = "modbus")]
+mod rtu_stream;

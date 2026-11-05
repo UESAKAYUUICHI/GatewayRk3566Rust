@@ -8,9 +8,10 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_serial::{
-    ClearBuffer, DataBits, Parity, SerialPort, SerialPortBuilderExt, SerialStream, StopBits,
+    DataBits, Parity, SerialPortBuilderExt, StopBits,
 };
 
+use crate::rtu_stream::RtuStream;
 use crate::transport::{MeterTransport, TransportError, TransportResult};
 
 /// 串口参数（默认 9600 8N1，主流导轨表出厂配置）。
@@ -64,13 +65,25 @@ impl Default for SerialConfig {
 
 /// 持有一条串口连接的严格 RTU 主站。
 pub struct ModbusRtuTransport {
-    stream: SerialStream,
+    stream: RtuStream,
     timeout: std::time::Duration,
     retry_count: u32,
 }
 
 impl ModbusRtuTransport {
     pub async fn connect(serial: &SerialConfig) -> Result<Self, TransportError> {
+        // Raw RTU frames over TCP, for serial bridges and the device simulator.
+        if let Some(address) = serial.port.strip_prefix("rtu+tcp://") {
+            let stream = tokio::time::timeout(
+                std::time::Duration::from_millis(serial.timeout_ms.max(100)),
+                tokio::net::TcpStream::connect(address)
+            ).await.map_err(|_| TransportError::NoResponse)?
+                .map_err(|error| TransportError::Io(error.to_string()))?;
+            stream.set_nodelay(true).map_err(|error| TransportError::Io(error.to_string()))?;
+            return Ok(Self { stream: RtuStream::Tcp(stream),
+                timeout: std::time::Duration::from_millis(serial.timeout_ms.max(100)),
+                retry_count: serial.retry_count });
+        }
         let data_bits = match serial.data_bits {
             5 => DataBits::Five,
             6 => DataBits::Six,
@@ -94,7 +107,7 @@ impl ModbusRtuTransport {
             .open_native_async()
             .map_err(|e| TransportError::Io(format!("打开串口 {} 失败: {e}", serial.port)))?;
         Ok(Self {
-            stream,
+            stream: RtuStream::Serial(stream),
             timeout: std::time::Duration::from_millis(serial.timeout_ms.max(100)),
             retry_count: serial.retry_count,
         })
@@ -102,7 +115,7 @@ impl ModbusRtuTransport {
 
     fn clear_input(&self) -> TransportResult<()> {
         self.stream
-            .clear(ClearBuffer::Input)
+            .clear_input()
             .map_err(|e| TransportError::Io(format!("清理串口输入缓冲失败: {e}")))
     }
 
