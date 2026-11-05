@@ -22,6 +22,10 @@ jobs:
           oversized = [str(p) for p in files if len(p.read_text(encoding="utf-8").splitlines()) > 400]
           assert not oversized, oversized
           PY
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev libfreetype6-dev libxkbcommon-dev libudev-dev libxcb1-dev libegl1-mesa-dev
       - run: rustup toolchain install stable --profile minimal
       - run: cargo +stable test --workspace --locked
         env:
