@@ -31,3 +31,5 @@ futures-util = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
 tokio-serial = { workspace = true }
+
+sha2 = "0.10"

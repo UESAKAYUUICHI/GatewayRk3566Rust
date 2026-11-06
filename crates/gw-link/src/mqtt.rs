@@ -3,14 +3,14 @@
 //! 自持连接生命周期：内部 eventloop 任务负责重连与状态上报，
 //! 指令下行经 mpsc 通道交给 agent；publish 等待对应报文的 Broker PUBACK。
 
-use std::time::Duration;
 use std::sync::Arc;
+use std::time::Duration;
 
+use crate::acknowledgements::PublishAcknowledgements;
 use async_trait::async_trait;
 use gw_core::snapshot::LinkHealth;
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, Outgoing, Packet, QoS};
-use tokio::sync::{mpsc, watch, oneshot, Mutex};
-use crate::acknowledgements::PublishAcknowledgements;
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 use crate::port::{CloudLink, LinkError, LinkOptions, LinkResult, RawCommand};
 
@@ -31,6 +31,7 @@ impl MqttLink {
         commands: mpsc::Sender<RawCommand>,
     ) -> (Self, tokio::task::JoinHandle<()>) {
         let alarm_ack_topic = format!("gateway/{}/alarm/ack", opts.gateway_id);
+        let strategy_topic = format!("gateway/{}/alarm/config/notify", opts.gateway_id);
         let mut mqtt = MqttOptions::new(&opts.client_id, &opts.host, opts.port);
         mqtt.set_keep_alive(Duration::from_secs(30));
         mqtt.set_max_packet_size(256 * 1024, 256 * 1024);
@@ -43,7 +44,11 @@ impl MqttLink {
 
         // 订阅指令下行主题（QoS1）
         let subscribe_client = client.clone();
-        let topics = vec![command_down_topic.clone(), alarm_ack_topic.clone()];
+        let topics = vec![
+            command_down_topic.clone(),
+            alarm_ack_topic.clone(),
+            strategy_topic.clone(),
+        ];
         tokio::spawn(async move {
             for topic in topics {
                 if let Err(e) = subscribe_client.subscribe(topic, QoS::AtLeastOnce).await {
@@ -73,7 +78,11 @@ impl MqttLink {
                         backoff = Duration::from_secs(1);
                         let _ = health_tx.send_replace(LinkHealth::Connected);
                         // 每次重连后补订阅（broker 不保留会话时必要）
-                        for topic in [command_down_topic.clone(), alarm_ack_topic.clone()] {
+                        for topic in [
+                            command_down_topic.clone(),
+                            alarm_ack_topic.clone(),
+                            strategy_topic.clone(),
+                        ] {
                             let _ = client.subscribe(topic, QoS::AtLeastOnce).await;
                         }
                     }
@@ -94,7 +103,15 @@ impl MqttLink {
             }
         });
 
-        (Self { client, health_rx, publish_lock: Mutex::new(()), acknowledgements }, handle)
+        (
+            Self {
+                client,
+                health_rx,
+                publish_lock: Mutex::new(()),
+                acknowledgements,
+            },
+            handle,
+        )
     }
 }
 
@@ -111,11 +128,13 @@ impl CloudLink for MqttLink {
         let (sender, receiver) = oneshot::channel();
         {
             let mut tracker = self.acknowledgements.lock().await;
-            self.client.try_publish(topic, QoS::AtLeastOnce, false, payload)
+            self.client
+                .try_publish(topic, QoS::AtLeastOnce, false, payload)
                 .map_err(|e| LinkError::Mqtt(format!("publish enqueue failed: {e}")))?;
             tracker.enqueue(sender);
         }
-        tokio::time::timeout(Duration::from_secs(30), receiver).await
+        tokio::time::timeout(Duration::from_secs(30), receiver)
+            .await
             .map_err(|_| LinkError::Mqtt("Broker PUBACK timeout".into()))?
             .map_err(|_| LinkError::Mqtt("Broker acknowledgement channel closed".into()))
     }

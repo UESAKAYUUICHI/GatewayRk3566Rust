@@ -165,20 +165,26 @@ async fn main() -> anyhow::Result<()> {
     let rule_sync_state = state.clone();
     let rule_sync_shutdown = shutdown.clone();
     tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        let mut last_attempt = None::<std::time::Instant>;
+        let mut last_success = None::<std::time::Instant>;
+        let mut last_failed = false;
         loop {
-            let interval_s = rule_sync_state
-                .store
-                .get_config("alarm_protocol_sync_interval_s")
-                .ok()
-                .flatten()
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(300)
-                .clamp(30, 86_400);
             tokio::select! {
                 _ = rule_sync_shutdown.cancelled() => return,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(interval_s)) => {
-                    if let Err(error) = gw_web::sync_platform_alarm_protocols_once(&rule_sync_state).await {
-                        tracing::debug!("平台告警协议同步暂未完成: {error:?}");
+                _ = tick.tick() => {
+                    let get = |key| rule_sync_state.store.get_config(key).ok().flatten();
+                    let requested = get("alarm_strategy_requested_revision");
+                    let applied = get("alarm_strategy_applied_revision");
+                    let due = last_success.is_none_or(|at| at.elapsed().as_secs() >= 300);
+                    let changed = requested.is_some() && requested != applied;
+                    let retry = !last_failed || last_attempt.is_none_or(|at| at.elapsed().as_secs() >= 30);
+                    if retry && (due || changed) {
+                        last_attempt = Some(std::time::Instant::now());
+                        match gw_web::sync_platform_alarm_protocols_once(&rule_sync_state).await {
+                            Ok(_) => { last_success = Some(std::time::Instant::now()); last_failed = false; },
+                            Err(error) => { last_failed = true; tracing::debug!("告警策略同步暂未完成: {error:?}"); },
+                        }
                     }
                 }
             }
